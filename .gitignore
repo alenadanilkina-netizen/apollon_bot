@@ -1,0 +1,5 @@
+users.db
+.env
+__pycache__/
+*.pyc
+methodology.pdf
