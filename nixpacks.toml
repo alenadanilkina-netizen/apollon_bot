@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python312", "gcc", "sqlite"]
+
+[phases.build]
+cmds = [
+  "SQLITE_LIB=$(find /nix/store -name 'libsqlite3.so.0' 2>/dev/null | head -1 || find /nix/store -name 'libsqlite3.so' 2>/dev/null | head -1) && ln -sf $SQLITE_LIB /usr/lib/libsqlite3.so.0 && echo 'sqlite linked: '$SQLITE_LIB",
+  "pip install pyswisseph --no-binary pyswisseph"
+]
