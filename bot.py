@@ -137,9 +137,12 @@ def call_mcp(tool: str, params: dict) -> dict:
         "method": "tools/call",
         "params": {"name": tool, "arguments": params}
     })
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
     result = subprocess.run(
         [sys.executable, str(MCP_SERVER)],
-        input=request, capture_output=True, text=True, timeout=30, encoding='utf-8'
+        input=request, capture_output=True, text=True, timeout=30, encoding='utf-8',
+        env=env
     )
     if result.returncode != 0:
         raise RuntimeError(f"MCP error: {result.stderr}")
