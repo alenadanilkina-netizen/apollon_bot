@@ -82,6 +82,18 @@ def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str
     con.commit()
     con.close()
 
+def db_load_user(tg_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT name, birth_day, birth_month, birth_year, birth_hour, birth_minute, city FROM users WHERE tg_id=?",
+        (tg_id,)
+    ).fetchone()
+    con.close()
+    if not row or not row[1]:
+        return None
+    name, d, m, y, h, mi, city = row
+    return {"name": name, "birth": {"day": d, "month": m, "year": y, "hour": h, "minute": mi or 0, "city": city or ""}}
+
 def db_add_block(tg_id: int, block: str):
     con = sqlite3.connect(DB_PATH)
     row = con.execute("SELECT blocks_seen FROM users WHERE tg_id=?", (tg_id,)).fetchone()
@@ -136,21 +148,25 @@ def call_mcp(tool: str, params: dict) -> dict:
     text = content[0].get("text", "") if content else ""
     return json.loads(text) if text.startswith("{") else {"raw": text}
 
+async def call_mcp_async(tool: str, params: dict) -> dict:
+    return await asyncio.to_thread(call_mcp, tool, params)
 
-def calculate_chart(birth: dict) -> tuple[dict, dict]:
-    """Считает натальную карту и HD"""
-    natal = call_mcp("natal_chart", {
-        "year": birth["year"], "month": birth["month"], "day": birth["day"],
-        "hour": birth["hour"], "minute": birth["minute"],
-        "timezone": birth["utc_offset"],
-        "lat": birth["lat"], "lon": birth["lon"]
-    })
-    hd = call_mcp("human_design", {
-        "year": birth["year"], "month": birth["month"], "day": birth["day"],
-        "hour": birth["hour"], "minute": birth["minute"],
-        "timezone": birth["utc_offset"],
-        "lat": birth["lat"], "lon": birth["lon"]
-    })
+async def calculate_chart(birth: dict) -> tuple[dict, dict]:
+    """Считает натальную карту и HD (async)"""
+    natal, hd = await asyncio.gather(
+        call_mcp_async("natal_chart", {
+            "year": birth["year"], "month": birth["month"], "day": birth["day"],
+            "hour": birth["hour"], "minute": birth["minute"],
+            "timezone": birth["utc_offset"],
+            "lat": birth["lat"], "lon": birth["lon"]
+        }),
+        call_mcp_async("human_design", {
+            "year": birth["year"], "month": birth["month"], "day": birth["day"],
+            "hour": birth["hour"], "minute": birth["minute"],
+            "timezone": birth["utc_offset"],
+            "lat": birth["lat"], "lon": birth["lon"]
+        })
+    )
     return natal, hd
 
 # ─── CLAUDE AI ────────────────────────────────────────────────────────────────
@@ -205,11 +221,10 @@ SYSTEM_PROMPT = f"""Ты — Аполлон, голос бота Алёны Да
 - Никаких списков с тире внутри текста — только абзацы
 """
 
-def ask_claude(user_id: int, message: str) -> str:
+def _ask_claude_sync(user_id: int, message: str) -> str:
     user = users.get(user_id, {})
     history = user.get("history", [])
 
-    # Добавляем контекст карты если есть
     context = ""
     if user.get("chart") or user.get("hd"):
         chart = user.get("chart", {})
@@ -229,9 +244,11 @@ def ask_claude(user_id: int, message: str) -> str:
     reply = response.content[0].text
     history.append({"role": "assistant", "content": reply})
 
-    # Храним последние 20 сообщений
     users[user_id]["history"] = history[-20:]
     return reply
+
+async def ask_claude(user_id: int, message: str) -> str:
+    return await asyncio.to_thread(_ask_claude_sync, user_id, message)
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
 
@@ -449,7 +466,7 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Смотрю в карту. Боги собираются...")
 
     try:
-        natal, hd = calculate_chart(users[uid]["birth"])
+        natal, hd = await calculate_chart(users[uid]["birth"])
         users[uid]["chart"] = natal
         users[uid]["hd"] = hd
 
@@ -475,7 +492,7 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "HD-тип в языке богов, и один точный вопрос к человеку о его жизни сейчас. "
             "Дай вкус, заинтригуй — но не раскрывай всё."
         )
-        reply = ask_claude(uid, prompt)
+        reply = await ask_claude(uid, prompt)
         await update.message.reply_text(reply, parse_mode="Markdown")
         users[uid]["menu_shown"] = False
         return CHAT
@@ -670,14 +687,16 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if uid not in users or not users[uid].get("chart"):
-        await query.message.reply_text("Напиши /start чтобы начать сначала.")
-        return
+        restored = await restore_session(uid, query.message)
+        if not restored or not users[uid].get("chart"):
+            await query.message.reply_text("Напиши /start чтобы начать сначала.")
+            return
 
     if query.data.startswith("forecast_"):
         birth = users[uid].get("birth", {})
         today = datetime.now()
         try:
-            transits_raw = call_mcp("transits", {
+            transits_raw = await call_mcp_async("transits", {
                 "birth_year": birth["year"], "birth_month": birth["month"],
                 "birth_day": birth["day"], "birth_hour": birth["hour"],
                 "birth_timezone": birth["utc_offset"],
@@ -691,7 +710,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         solar_str = ""
         if query.data == "forecast_year":
             try:
-                solar_raw = call_mcp("solar_return", {
+                solar_raw = await call_mcp_async("solar_return", {
                     "birth_year": birth["year"], "birth_month": birth["month"],
                     "birth_day": birth["day"], "birth_hour": birth["hour"],
                     "birth_minute": birth.get("minute", 0),
@@ -706,7 +725,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name = users[uid].get("name", "")
         prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{get_forecast_prompt(query.data, transits_str + solar_str)}"
         await query.message.reply_text("Смотрю что происходит на небе...")
-        reply = ask_claude(uid, prompt)
+        reply = await ask_claude(uid, prompt)
         await query.message.reply_text(reply, parse_mode="Markdown")
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
         return CHAT
@@ -726,11 +745,34 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return CHAT
 
 
+async def restore_session(uid: int, msg_obj) -> bool:
+    """Восстанавливает сессию из БД если бот перезапустился. Возвращает True если восстановлено."""
+    saved = db_load_user(uid)
+    if not saved:
+        return False
+    users[uid] = {"history": [], "trial_start": datetime.now(), **saved}
+    await msg_obj.reply_text("Секунду, восстанавливаю твою карту...")
+    try:
+        # Нужны координаты — загрузим из города
+        birth = users[uid]["birth"]
+        if "lat" not in birth:
+            coords = parse_city(birth.get("city", ""))
+            if coords:
+                birth["lat"], birth["lon"], birth["utc_offset"] = coords
+        natal, hd = await calculate_chart(birth)
+        users[uid]["chart"] = natal
+        users[uid]["hd"] = hd
+    except Exception:
+        pass
+    return True
+
 async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in users:
-        await update.message.reply_text("Напиши /start чтобы начать")
-        return ConversationHandler.END
+        restored = await restore_session(uid, update.message)
+        if not restored:
+            await update.message.reply_text("Напиши /start чтобы начать")
+            return ConversationHandler.END
 
     user_text = update.message.text.strip()
 
@@ -786,7 +828,7 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text("Считаю карты. Боги знакомятся...")
             try:
-                natal2, hd2 = calculate_chart(compat["birth"])
+                natal2, hd2 = await calculate_chart(compat["birth"])
                 name1 = users[uid].get("name", "")
                 name2 = compat["name"]
                 rel_type = compat.get("type", "отношения")
@@ -816,7 +858,7 @@ HD {name2}: {hd2_str}
 
 Обращайся к {name1} на "ты". Конкретно, без воды, без терминов."""
 
-                reply = ask_claude(uid, prompt)
+                reply = await ask_claude(uid, prompt)
                 await update.message.reply_text(reply, parse_mode="Markdown")
                 await update.message.reply_text("Что ещё исследуем?", reply_markup=MENU_KEYBOARD)
                 users[uid]["menu_shown"] = True
@@ -924,7 +966,7 @@ HD {name2}:
 
 Обращайся к {name1} на "ты". Говори конкретно, без воды. Никаких терминов без перевода на человеческий язык."""
 
-        reply = ask_claude(uid, prompt)
+        reply = await ask_claude(uid, prompt)
         await update.message.reply_text(reply, parse_mode="Markdown")
         await update.message.reply_text("Что ещё исследуем?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
