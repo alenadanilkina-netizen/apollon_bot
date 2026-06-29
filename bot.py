@@ -139,7 +139,7 @@ def call_mcp(tool: str, params: dict) -> dict:
     })
     result = subprocess.run(
         [sys.executable, str(MCP_SERVER)],
-        input=request, capture_output=True, text=True, timeout=30
+        input=request, capture_output=True, text=True, timeout=30, encoding='utf-8'
     )
     if result.returncode != 0:
         raise RuntimeError(f"MCP error: {result.stderr}")
