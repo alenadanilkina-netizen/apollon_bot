@@ -501,9 +501,9 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return CHAT
 
     except Exception as e:
-        await update.message.reply_text(
-            f"Что-то пошло не так при расчёте карты. Попробуй позже.\n({e})"
-        )
+        import traceback
+        tb = traceback.format_exc()
+        await update.message.reply_text(f"Ошибка:\n{tb[-800:]}")
         return ConversationHandler.END
 
 
