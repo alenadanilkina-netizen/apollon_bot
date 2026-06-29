@@ -1,2 +1,5 @@
 [phases.setup]
-nixPkgs = ["sqlite", "gcc"]
+nixPkgs = ["sqlite", "gcc", "python312"]
+
+[phases.build]
+cmds = ["pip install pyswisseph --no-binary pyswisseph"]
