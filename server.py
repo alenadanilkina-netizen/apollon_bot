@@ -8,6 +8,19 @@ Astrology + Human Design MCP Server
 import sys
 import json
 import math
+import ctypes
+import glob
+
+# Preload libsqlite3 so pyswisseph can find it regardless of ldconfig state
+for _pattern in ['/usr/lib/*/libsqlite3.so.0', '/usr/lib/libsqlite3.so.0',
+                 '/lib/*/libsqlite3.so.0', '/usr/local/lib/libsqlite3.so.0']:
+    for _path in glob.glob(_pattern):
+        try:
+            ctypes.CDLL(_path)
+            break
+        except Exception:
+            pass
+
 import swisseph as swe
 
 # ═══════════════════════════════════════════════════════════════════════════════
