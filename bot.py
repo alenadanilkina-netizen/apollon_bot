@@ -10,6 +10,8 @@ import asyncio
 import subprocess
 import sys
 import sqlite3
+import urllib.request
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 
@@ -331,6 +333,21 @@ def parse_city(text: str):
     for city, data in CITIES.items():
         if city in key or key in city:
             return data
+    # Геокодер Nominatim для любого города
+    try:
+        query = urllib.parse.urlencode({"q": text, "format": "json", "limit": 1})
+        url = f"https://nominatim.openstreetmap.org/search?{query}"
+        req = urllib.request.Request(url, headers={"User-Agent": "apollon-bot/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            results = json.loads(resp.read())
+        if results:
+            lat = float(results[0]["lat"])
+            lon = float(results[0]["lon"])
+            # Определяем UTC offset по долготе (приблизительно)
+            utc = round(lon / 15)
+            return (lat, lon, utc)
+    except Exception:
+        pass
     return None
 
 # ─── ОБРАБОТЧИКИ ─────────────────────────────────────────────────────────────
