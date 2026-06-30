@@ -137,16 +137,13 @@ def call_mcp(tool: str, params: dict) -> dict:
         "method": "tools/call",
         "params": {"name": tool, "arguments": params}
     })
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
     result = subprocess.run(
         [sys.executable, str(MCP_SERVER)],
-        input=request, capture_output=True, text=True, timeout=30, encoding='utf-8',
-        env=env
+        input=request.encode('utf-8'), capture_output=True, timeout=30
     )
     if result.returncode != 0:
-        raise RuntimeError(f"MCP error: {result.stderr}")
-    response = json.loads(result.stdout)
+        raise RuntimeError(f"MCP error: {result.stderr.decode('utf-8', errors='replace')}")
+    response = json.loads(result.stdout.decode('utf-8'))
     content = response.get("result", {}).get("content", [{}])
     text = content[0].get("text", "") if content else ""
     return json.loads(text) if text.startswith("{") else {"raw": text}
@@ -501,9 +498,9 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return CHAT
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        await update.message.reply_text(f"Ошибка:\n{tb[-800:]}")
+        await update.message.reply_text(
+            f"Что-то пошло не так при расчёте карты. Попробуй позже.\n({e})"
+        )
         return ConversationHandler.END
 
 
