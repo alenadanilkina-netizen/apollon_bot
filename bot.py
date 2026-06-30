@@ -773,9 +773,10 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     full_prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{prompt}"
 
     await query.message.reply_text("Смотрю в карту...")
-    reply = ask_claude(uid, full_prompt)
+    reply = await ask_claude(uid, full_prompt)
     await query.message.reply_text(reply, parse_mode="Markdown")
-    users[uid]["menu_shown"] = False
+    await query.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
+    users[uid]["menu_shown"] = True
     return CHAT
 
 
