@@ -106,6 +106,144 @@ def _build_types_index() -> dict:
     return index
 
 
+# ─── PHS ПЕРЕМЕННЫЕ ──────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=1)
+def _build_phs_index() -> dict:
+    """
+    Строит индекс PHS из hd_phs_index.txt.
+    Возвращает {
+      'env': {1: text, 2: text, ..., 6: text},   # 6 типов Среды
+      'det': {1: text, ..., 6: text},             # 6 типов Детерминации
+      'mot': {1: text, ..., 6: text},             # 6 Мотиваций
+      'cog': {1: text, ..., 6: text},             # 6 Когниций
+    }
+    """
+    text = _load('hd_phs_index.txt')
+    if not text:
+        return {}
+
+    index = {'env': {}, 'det': {}, 'mot': {}, 'cog': {}}
+
+    # Секция среды
+    env_pattern = re.compile(r'###\s+(CAVE|MARKET|KITCHEN|MOUNTAIN|VALLEY|SHORE).*?— Нодальный Цвет (\d+)\n(.*?)(?=###|\Z)', re.DOTALL | re.IGNORECASE)
+    for m in env_pattern.finditer(text):
+        num = int(m.group(2))
+        index['env'][num] = m.group(3).strip()[:1500]
+
+    # Секция детерминации
+    det_pattern = re.compile(r'###\s+COLOR (\d+)\s*—\s*([^\[]+)\[([^\]]+)\]\n(.*?)(?=###|\Z)', re.DOTALL)
+    for m in det_pattern.finditer(text):
+        num = int(m.group(1))
+        index['det'][num] = f"{m.group(2).strip()} [{m.group(3)}]\n{m.group(4).strip()[:1500]}"
+
+    # Мотивации и когниции — из строк "Линия X →"
+    mot_block = re.search(r'МОТИВАЦИИ.*?(?=КОГНИЦИИ|\Z)', text, re.DOTALL)
+    if mot_block:
+        for m in re.finditer(r'Линия (\d+) → (.+)', mot_block.group()):
+            index['mot'][int(m.group(1))] = m.group(2).strip()
+
+    cog_block = re.search(r'КОГНИЦИИ.*', text, re.DOTALL)
+    if cog_block:
+        for m in re.finditer(r'Линия (\d+) → (.+)', cog_block.group()):
+            index['cog'][int(m.group(1))] = m.group(2).strip()
+
+    return index
+
+
+ENV_NAMES = {1:"Пещера (Cave)", 2:"Рынок (Market)", 3:"Кухня (Kitchen)",
+             4:"Гора (Mountain)", 5:"Долина (Valley)", 6:"Берег (Shore)"}
+DET_NAMES = {1:"Последовательный (Consecutive)", 2:"Вкус (Taste)", 3:"Открытый (Open/Thirst)",
+             4:"Прикосновение (Touch)", 5:"Звук (Sound)", 6:"Свет (Light)"}
+MOT_NAMES = {1:"Страх (Fear)", 2:"Надежда (Hope)", 3:"Желание (Desire)",
+             4:"Потребность (Need)", 5:"Вина (Guilt)", 6:"Невинность (Innocence)"}
+COG_NAMES = {1:"Выживание (Survival)", 2:"Жертва (Sacrifice)", 3:"Фантазия (Fantasy)",
+             4:"Вероятность (Probability)", 5:"Эмпатия (Empathy)", 6:"Солидарность (Solidarity)"}
+
+
+def get_phs_context(hd_data: dict) -> str:
+    """
+    По карте HD вычисляет 4 переменных и возвращает их описания из PHS книг.
+
+    Переменные:
+      Детерминация = линия Сознательного Солнца (Personality Sun)
+      Среда        = линия Дизайнного Северного Узла (Design North Node)
+      Мотивация    = линия Сознательной Земли (Personality Earth)
+      Когниция     = линия Дизайнной Земли (Design Earth)
+    """
+    raw = hd_data.get('raw', '')
+    if not raw:
+        return ''
+
+    phs = _build_phs_index()
+    if not phs:
+        return ''
+
+    # Парсим нужные 4 линии
+    def get_line(section_text, planet):
+        m = re.search(rf'{planet}\s+Ворота\s+\d+\.(\d+)', section_text)
+        return int(m.group(1)) if m else None
+
+    con_section = re.search(r'СОЗНАТЕЛЬНЫЕ ВОРОТА.*?(?=БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+    unc_section = re.search(r'БЕССОЗНАТЕЛЬНЫЕ ВОРОТА.*', raw, re.DOTALL)
+
+    con_text = con_section.group() if con_section else ''
+    unc_text = unc_section.group() if unc_section else ''
+
+    det_line = get_line(con_text, 'Солнце')    # Personality Sun → Детерминация
+    env_line = get_line(unc_text, 'С\\.Узел')  # Design North Node → Среда
+    mot_line = get_line(con_text, 'Земля')     # Personality Earth → Мотивация
+    cog_line = get_line(unc_text, 'Земля')     # Design Earth → Когниция
+
+    sections = []
+
+    # Детерминация (питание/тело)
+    if det_line:
+        side = "Left (Активный)" if det_line <= 3 else "Right (Пассивный)"
+        name = DET_NAMES.get(det_line, f"Color {det_line}")
+        desc = phs['det'].get(det_line, '')
+        sections.append(
+            f"=== ДЕТЕРМИНАЦИЯ: {name} [{side}] ===\n"
+            f"Тип питания и работы с телом. Линия Личностного Солнца: {det_line}\n"
+            + (desc[:800] if desc else "")
+        )
+
+    # Среда (окружение)
+    if env_line:
+        side = "Active (движение)" if env_line <= 3 else "Passive (постоянство)"
+        name = ENV_NAMES.get(env_line, f"Color {env_line}")
+        desc = phs['env'].get(env_line, '')
+        sections.append(
+            f"=== СРЕДА: {name} [{side}] ===\n"
+            f"Оптимальная среда для здоровья и эффективности. Линия Дизайнного Узла: {env_line}\n"
+            + (desc[:800] if desc else "")
+        )
+
+    # Мотивация
+    if mot_line:
+        side = "Left" if mot_line <= 3 else "Right"
+        name = MOT_NAMES.get(mot_line, f"Мотивация {mot_line}")
+        desc = phs['mot'].get(mot_line, '')
+        sections.append(
+            f"=== МОТИВАЦИЯ: {name} [{side}] ===\n"
+            f"Что движет изнутри. Линия Личностной Земли: {mot_line}\n"
+            + (desc if desc else "")
+        )
+
+    # Когниция
+    if cog_line:
+        side = "Left" if cog_line <= 3 else "Right"
+        name = COG_NAMES.get(cog_line, f"Когниция {cog_line}")
+        desc = phs['cog'].get(cog_line, '')
+        sections.append(
+            f"=== КОГНИЦИЯ: {name} [{side}] ===\n"
+            f"Как воспринимает и обрабатывает мир. Линия Дизайнной Земли: {cog_line}\n"
+            + (desc if desc else "")
+        )
+
+    return '\n\n'.join(sections)
+
+
 # ─── КНИГА ЛЮБВИ ─────────────────────────────────────────────────────────────
 
 # Ворота любви из Love Book (Ra Uru Hu)
