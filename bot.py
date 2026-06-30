@@ -1294,6 +1294,38 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_button))
 
+    # ── Health-check раз в час ──
+    async def run_health_check(context):
+        try:
+            import health_check as hc
+            hc.BOT_TOKEN     = TELEGRAM_TOKEN
+            hc.ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")
+            hc.ANTHROPIC_KEY = ANTHROPIC_API_KEY
+            if not hc.ALERT_CHAT_ID:
+                return  # некуда слать — молчим
+            results = []
+            failed  = []
+            for name, check_fn in hc.CHECKS:
+                try:
+                    ok, msg = await check_fn()
+                except Exception as e:
+                    ok, msg = False, str(e)
+                results.append((name, ok, msg))
+                if not ok:
+                    failed.append((name, msg))
+            if failed:
+                lines = ["Обнаружены проблемы:\n"]
+                for name, msg in failed:
+                    lines.append(f"❌ *{name}*: `{msg[:200]}`")
+                lines.append(f"\nПрошло: {len(results)-len(failed)}/{len(results)}")
+                await hc.send_alert("\n".join(lines), is_ok=False)
+        except Exception as e:
+            print(f"Health-check error: {e}")
+
+    job_queue = app.job_queue
+    if job_queue:
+        job_queue.run_repeating(run_health_check, interval=3600, first=60)
+
     print("🤖 Бот запущен. Ctrl+C для остановки.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
