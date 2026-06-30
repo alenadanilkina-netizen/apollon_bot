@@ -865,7 +865,7 @@ HD {name2}: {hd2_str}
                 await update.message.reply_text(f"Что-то пошло не так. ({e})")
             return CHAT
 
-    reply = ask_claude(uid, user_text)
+    reply = await ask_claude(uid, user_text)
     await update.message.reply_text(reply, parse_mode="Markdown")
 
     # Показываем меню только если Claude не задал вопрос в конце
