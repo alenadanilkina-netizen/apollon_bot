@@ -29,6 +29,7 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 from anthropic import Anthropic
+from hd_library import get_hd_context
 
 # ─── КОНФИГ ──────────────────────────────────────────────────────────────────
 
@@ -234,7 +235,13 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
         hd = user.get("hd", {})
         chart_str = chart.get("raw", json.dumps(chart, ensure_ascii=False))
         hd_str = hd.get("raw", json.dumps(hd, ensure_ascii=False))
-        context = f"\n\nКАРТА ПОЛЬЗОВАТЕЛЯ:\n{chart_str}\n\nHD ПОЛЬЗОВАТЕЛЯ:\n{hd_str}"
+        # Вытаскиваем релевантные описания из библиотеки HD
+        hd_library_context = get_hd_context(hd)
+        context = (
+            f"\n\nКАРТА ПОЛЬЗОВАТЕЛЯ (астрология):\n{chart_str}"
+            f"\n\nHD ПОЛЬЗОВАТЕЛЯ (сырые данные):\n{hd_str}"
+            f"\n\nHD БИБЛИОТЕКА (описания типа, авторитета, центров, каналов, ворот):\n{hd_library_context}"
+        )
 
     history.append({"role": "user", "content": message + context if not history else message})
 
