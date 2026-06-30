@@ -495,7 +495,7 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         reply = await ask_claude(uid, prompt)
         await update.message.reply_text(reply, parse_mode="Markdown")
-        await update.message.reply_text("Что хочешь исследовать?", reply_markup=MENU_KEYBOARD)
+        await update.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
         return CHAT
 
@@ -553,14 +553,18 @@ BLOCK_PROMPTS = {
 - Что ему нужно от партнёра, но он никогда не просит прямо
 - Какие условия нужны для того, чтобы отношения работали
 Один точный вопрос в конце.""",
-    "block_money": """Разбери тему денег через карту. Будь конкретной — не философски, а практически.
-Ответь через богов и HD:
-- Через что идут деньги у этого человека: через экспертизу, через отношения, через создание, через управление
-- Какая модель заработка работает: найм, консультации, собственный продукт, партнёрство
-- Что блокирует деньги — конкретный паттерн поведения
-- Какую цену этот человек хронически занижает и почему
-- Когда деньги идут легко — что при этом происходит в жизни
-Один точный вопрос в конце.""",
+    "block_money": """Разбери тему денег через карту. Коротко, конкретно, без воды.
+
+Начни с одной фразы — что сейчас происходит у богов вокруг темы денег (игриво, образно).
+
+Потом 3-4 абзаца — каждый про один конкретный механизм:
+1. Как у этого человека включается денежный поток — через что именно (усилие, отношения, глубину, скорость, признание). Конкретно, не абстрактно.
+2. Главный блок — что происходит в поведении когда деньги не идут. Назови паттерн точно.
+3. Что этот человек хронически занижает в себе и почему — через богов, конкретно.
+4. Когда деньги идут легко — что при этом совпадает в жизни.
+
+ЗАПРЕТ: никаких знаков зодиака в основном тексте. Никаких "Зевс в Весах" после первой фразы. Боги — это характеры и поведение, не позиции.
+Никакого вопроса в конце — меню придёт отдельно.""",
     "block_health": """Разбери тему ресурса и энергии через карту. Конкретно, не абстрактно.
 Ответь через богов и HD:
 - Как этот человек теряет энергию быстрее всего — конкретные ситуации, люди, форматы работы
@@ -573,7 +577,7 @@ BLOCK_PROMPTS = {
 
 async def send_menu(update: Update):
     await update.message.reply_text(
-        "Что хочешь исследовать глубже?",
+        "Боги приглашают тебя исследовать свой пантеон. С чего начнём?",
         reply_markup=MENU_KEYBOARD
     )
 
@@ -655,7 +659,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "back_to_menu":
-        await query.message.reply_text("Что исследуем?", reply_markup=MENU_KEYBOARD)
+        await query.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
         return
 
     if query.data == "compat_start":
@@ -887,7 +891,7 @@ HD {name2}: {hd2_str}
 
                 reply = await ask_claude(uid, prompt)
                 await update.message.reply_text(reply, parse_mode="Markdown")
-                await update.message.reply_text("Что ещё исследуем?", reply_markup=MENU_KEYBOARD)
+                await update.message.reply_text("Что ещё исследуем у богов?", reply_markup=MENU_KEYBOARD)
                 users[uid]["menu_shown"] = True
             except Exception as e:
                 await update.message.reply_text(f"Что-то пошло не так. ({e})")
@@ -900,7 +904,7 @@ HD {name2}: {hd2_str}
     ends_with_question = reply.strip().endswith("?")
     if not users[uid].get("menu_shown") and not ends_with_question:
         users[uid]["menu_shown"] = True
-        await update.message.reply_text("Что хочешь исследовать?", reply_markup=MENU_KEYBOARD)
+        await update.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
 
     return CHAT
 
@@ -995,7 +999,7 @@ HD {name2}:
 
         reply = await ask_claude(uid, prompt)
         await update.message.reply_text(reply, parse_mode="Markdown")
-        await update.message.reply_text("Что ещё исследуем?", reply_markup=MENU_KEYBOARD)
+        await update.message.reply_text("Что ещё исследуем у богов?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
         return CHAT
 
