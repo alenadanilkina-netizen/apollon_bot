@@ -559,7 +559,7 @@ def tool_lunar_return(args):
 
 
 def tool_hd_cycles(args):
-    """HD-циклы на год: даты прохождения Солнца через все 64 ворота + активируемые каналы"""
+    """HD-циклы на год: личный Новый год HD + даты прохождения Солнца через 64 ворота"""
     import datetime as dt
     year   = int(args["birth_year"])
     month  = int(args["birth_month"])
@@ -571,9 +571,13 @@ def tool_hd_cycles(args):
     now = dt.datetime.utcnow()
     cycle_year = int(args.get("cycle_year", now.year))
 
-    jd_natal = birth_to_jd(year, month, day, hour, minute, tz)
+    jd_natal  = birth_to_jd(year, month, day, hour, minute, tz)
+    # Дизайнное Солнце: точно 88° до натального Солнца по эклиптике
+    natal_sun_lon = swe.calc_ut(jd_natal, swe.SUN, swe.FLG_SWIEPH)[0][0]
+    design_sun_lon = (natal_sun_lon - 88.0) % 360
 
-    # Натальные ворота (Личность + Дизайн)
+    # Натальные ворота (Личность + Дизайн), для поиска активируемых каналов
+    # Дизайнная точка ~88 дней до рождения
     jd_design = jd_natal - 88.0
     natal_gates = set()
     for planet_id, _ in PLANETS:
@@ -582,15 +586,36 @@ def tool_hd_cycles(args):
             idx = int(lon / 5.625) % 64
             natal_gates.add(HD_GATES_BY_DEGREE[idx])
 
-    # Проходим по дням года, фиксируем смену ворот Солнца
-    jd_start = swe.julday(cycle_year, 1, 1, 0.0)
-    jd_end   = swe.julday(cycle_year, 12, 31, 23.0)
+    # ── Личный HD Новый год: когда транзитное Солнце возвращается в позицию Дизайнного Солнца ──
+    # Ищем в диапазоне ±180 дней от 1 января cycle_year
+    jd_search = swe.julday(cycle_year, 1, 1, 0.0)
+    jd_hd_ny = jd_search
+    for _ in range(200):
+        cur = swe.calc_ut(jd_hd_ny, swe.SUN, swe.FLG_SWIEPH)[0][0]
+        diff = (design_sun_lon - cur + 180) % 360 - 180
+        if abs(diff) < 0.0001:
+            break
+        jd_hd_ny += diff / 360
 
-    lines = [f"═══ HD-ЦИКЛЫ {cycle_year}: Солнце через 64 ворота ═══", ""]
-    lines.append("Солнце проводит в каждых воротах ~5.6 дней.")
-    lines.append("★ = канал активируется с натальными воротами (энергетический импульс)")
+    hd_ny_date = swe.revjul(jd_hd_ny)
+    hd_ny_str = f"{int(hd_ny_date[2]):02d}.{int(hd_ny_date[1]):02d}.{int(hd_ny_date[0])}  {int(hd_ny_date[3]):02d}:{int((hd_ny_date[3]%1)*60):02d} UTC"
+    design_sign, design_d, design_m, _ = deg_to_sign(design_sun_lon)
+    design_gate = HD_GATES_BY_DEGREE[int(design_sun_lon / 5.625) % 64]
+
+    lines = [f"═══ HD-ЦИКЛЫ {cycle_year} ═══", ""]
+    lines.append("── ЛИЧНЫЙ НОВЫЙ ГОД HD ──")
+    lines.append(f"Дизайнное Солнце: {design_sign} {design_d}°{design_m:02d}'  (Ворота {design_gate})")
+    lines.append(f"Транзит наступает: {hd_ny_str}")
+    lines.append("Это точка где начинается твой личный HD-год — новая тема, новый импульс.")
     lines.append("")
 
+    # ── Прохождение Солнца через 64 ворота ──
+    lines.append("── СОЛНЦЕ ЧЕРЕЗ 64 ВОРОТА ──")
+    lines.append("★ = Солнце замыкает канал с натальными воротами (энергетический пик)")
+    lines.append("")
+
+    jd_start = swe.julday(cycle_year, 1, 1, 0.0)
+    jd_end   = swe.julday(cycle_year, 12, 31, 23.0)
     prev_gate = None
     jd = jd_start
     while jd <= jd_end:
@@ -600,20 +625,17 @@ def tool_hd_cycles(args):
         if gate != prev_gate:
             d = swe.revjul(jd)
             date_str = f"{int(d[2]):02d}.{int(d[1]):02d}"
-            # Проверяем активируется ли канал
             channel_note = ""
             for ga, gb in CHANNELS:
-                partner = None
                 if ga == gate and gb in natal_gates:
-                    partner = gb
+                    channel_note = f"  ★ канал {gate}-{gb}"
+                    break
                 elif gb == gate and ga in natal_gates:
-                    partner = ga
-                if partner:
-                    channel_note = f"  ★ канал {gate}-{partner}"
+                    channel_note = f"  ★ канал {ga}-{gate}"
                     break
             lines.append(f"{date_str}  Ворота {gate:>2}{channel_note}")
             prev_gate = gate
-        jd += 0.25  # шаг 6 часов для точности смены ворот
+        jd += 0.25
 
     lines.append("")
     lines.append(f"Натальные ворота: {sorted(natal_gates)}")
