@@ -106,6 +106,65 @@ def _build_types_index() -> dict:
     return index
 
 
+# ─── КРЕСТ ВОПЛОЩЕНИЯ ────────────────────────────────────────────────────────
+
+def get_cross_context(hd_data: dict) -> str:
+    """
+    Возвращает описания 4 ворот Креста воплощения из Line Companion.
+    Используется в блоке призвания/миссии.
+    """
+    raw = hd_data.get('raw', '')
+    if not raw:
+        return ''
+
+    gates_idx = _build_gates_index()
+    sections = []
+
+    # Парсим крест из HD raw
+    cross_match = re.search(
+        r'КРЕСТ ВОПЛОЩЕНИЯ.*?\n'
+        r'\s*Ось Личности:.*?Солнце\s+(\d+)\.(\d+).*?Земля\s+(\d+)\.(\d+).*?\n'
+        r'\s*Ось Дизайна:.*?Солнце\s+(\d+)\.(\d+).*?Земля\s+(\d+)\.(\d+)',
+        raw, re.DOTALL
+    )
+
+    if not cross_match:
+        return ''
+
+    ps_g, ps_l = int(cross_match.group(1)), int(cross_match.group(2))
+    pe_g, pe_l = int(cross_match.group(3)), int(cross_match.group(4))
+    ds_g, ds_l = int(cross_match.group(5)), int(cross_match.group(6))
+    de_g, de_l = int(cross_match.group(7)), int(cross_match.group(8))
+
+    gate_quartet = [
+        (ps_g, ps_l, "Солнце Личности — сознательная тема жизни"),
+        (pe_g, pe_l, "Земля Личности — сознательное заземление"),
+        (ds_g, ds_l, "Солнце Дизайна — бессознательная движущая сила"),
+        (de_g, de_l, "Земля Дизайна — бессознательное заземление"),
+    ]
+
+    cross_texts = []
+    for gate_num, line_num, role in gate_quartet:
+        gate_data = gates_idx.get(gate_num, {})
+        gate_full = gate_data.get('full', '')[:200]
+        line_text = gate_data.get('lines', {}).get(line_num, '')[:500]
+        if gate_full or line_text:
+            entry = f"Ворота {gate_num}.{line_num} [{role}]:\n"
+            if gate_full:
+                entry += f"  Суть ворот: {gate_full}\n"
+            if line_text:
+                entry += f"  Линия {line_num}: {line_text}"
+            cross_texts.append(entry)
+
+    if cross_texts:
+        sections.append(
+            "=== КРЕСТ ВОПЛОЩЕНИЯ — описания из Line Companion ===\n"
+            + "\n\n".join(cross_texts)
+        )
+
+    return '\n\n'.join(sections)
+
+
 # ─── ГЛАВНАЯ ФУНКЦИЯ ─────────────────────────────────────────────────────────
 
 def get_hd_context(hd_data: dict) -> str:

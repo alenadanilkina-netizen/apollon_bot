@@ -203,6 +203,20 @@ def calc_houses(jd, lat, lon):
     cusps, ascmc = swe.houses(jd, lat, lon, b'P')
     return cusps, ascmc[0], ascmc[1]  # cusps, ASC, MC
 
+def get_house_num(lon: float, cusps: tuple) -> int:
+    """Возвращает номер дома (1-12) для данной долготы."""
+    lon = lon % 360
+    for i in range(12):
+        cusp_start = cusps[i] % 360
+        cusp_end = cusps[(i + 1) % 12] % 360
+        if cusp_start <= cusp_end:
+            if cusp_start <= lon < cusp_end:
+                return i + 1
+        else:  # перекрытие 0°
+            if lon >= cusp_start or lon < cusp_end:
+                return i + 1
+    return 1
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ИНСТРУМЕНТЫ MCP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -239,12 +253,19 @@ def tool_natal_chart(args):
     asc_sign, ad, am, _ = deg_to_sign(asc)
     mc_sign, md, mm, _  = deg_to_sign(mc)
     lines.append(f"АСЦ: {asc_sign} {ad}°{am:02d}'   МС: {mc_sign} {md}°{mm:02d}'")
-    lines.append(f"{'Планета':<12} {'Знак':<13} {'Градус':<10} R")
-    lines.append("─"*42)
+    lines.append(f"{'Планета':<12} {'Знак':<13} {'Градус':<10} {'Дом':<5} R")
+    lines.append("─"*48)
     for pname, pdata in trop.items():
         sign, d, m, _ = deg_to_sign(pdata["lon"])
+        house = get_house_num(pdata["lon"], cusps)
         r = "℞" if pdata["retro"] else ""
-        lines.append(f"{pname:<12} {sign:<13} {d:2d}°{m:02d}'      {r}")
+        lines.append(f"{pname:<12} {sign:<13} {d:2d}°{m:02d}'     {house:<5} {r}")
+    # Куспиды домов для призвания
+    lines.append("")
+    lines.append("КЛЮЧЕВЫЕ ДОМА:")
+    for h_num in [2, 6, 8, 10, 12]:
+        sign, d, m, _ = deg_to_sign(cusps[h_num - 1])
+        lines.append(f"  {h_num}-й дом: {sign} {d}°{m:02d}'")
 
     lines.append("")
     lines.append(f"── ДЖЙОТИШ (Сидерический, Лахири, айанамша {ayanamsha:.2f}°) ──")
@@ -400,6 +421,30 @@ def tool_human_design(args):
     lines.append(f"КАНАЛЫ ({len(defined_channels)}):")
     for ch in defined_channels:
         lines.append(f"  {ch[0]}-{ch[1]}")
+    lines.append("")
+    # Крест воплощения (4 оси)
+    ps_gate = con_gates.get("Солнце", {})
+    pe_gate = con_gates.get("Земля", {})
+    ds_gate = unc_gates.get("Солнце", {})
+    de_gate = unc_gates.get("Земля", {})
+    if ps_gate and pe_gate and ds_gate and de_gate:
+        lines.append("КРЕСТ ВОПЛОЩЕНИЯ (тема жизни):")
+        lines.append(f"  Ось Личности:  Солнце {ps_gate['gate']}.{ps_gate['line']} ↔ Земля {pe_gate['gate']}.{pe_gate['line']}")
+        lines.append(f"  Ось Дизайна:   Солнце {ds_gate['gate']}.{ds_gate['line']} ↔ Земля {de_gate['gate']}.{de_gate['line']}")
+        # Определяем четверть (Initiation/Civilization/Duality/Mutation)
+        ps_num = ps_gate['gate']
+        quarters = {
+            "Инициации":     [13,49,30,55,37,63,22,36,25,17,21,51,42,3,27,24],
+            "Цивилизации":   [2,23,8,20,16,35,45,12,15,52,39,53,62,56,31,33],
+            "Двойственности":[7,4,29,59,40,64,47,6,46,18,48,57,32,50,28,44],
+            "Мутации":       [1,43,14,34,9,5,26,11,10,58,38,54,61,60,41,19],
+        }
+        cross_quarter = "—"
+        for qname, gates_list in quarters.items():
+            if ps_num in gates_list:
+                cross_quarter = qname
+                break
+        lines.append(f"  Четверть:      {cross_quarter}")
     lines.append("")
     lines.append("СОЗНАТЕЛЬНЫЕ ВОРОТА (личность — чёрный):")
     for pname, pg in con_gates.items():
