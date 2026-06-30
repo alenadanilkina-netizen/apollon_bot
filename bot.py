@@ -653,6 +653,13 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     uid = query.from_user.id
 
+    # Восстанавливаем сессию если бот перезапустился
+    if uid not in users and query.data not in ("full_reading", "back_to_menu"):
+        restored = await restore_session(uid, query.message)
+        if not restored:
+            await query.message.reply_text("Сессия не найдена. Напиши /start чтобы начать.")
+            return
+
     if query.data == "full_reading":
         await query.message.reply_text(
             "Алёна Данилкина — пиарщик и креативный продюсер с 20-летним опытом в кросс-индустриальных проектах. "
