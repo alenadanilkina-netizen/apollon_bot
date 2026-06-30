@@ -781,9 +781,14 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_add_block(uid, query.data)
     full_prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{prompt}"
 
-    await query.message.reply_text("Смотрю в карту...")
-    reply = await ask_claude(uid, full_prompt)
-    await query.message.reply_text(reply, parse_mode="Markdown")
+    try:
+        await query.message.reply_text("Смотрю в карту...")
+        reply = await ask_claude(uid, full_prompt)
+        await query.message.reply_text(reply, parse_mode="Markdown")
+    except Exception as e:
+        import traceback
+        await query.message.reply_text(f"Ошибка: {traceback.format_exc()[-500:]}")
+        return CHAT
     await query.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
     users[uid]["menu_shown"] = True
     return CHAT
