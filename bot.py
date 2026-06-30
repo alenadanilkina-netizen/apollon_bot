@@ -1324,7 +1324,24 @@ def main():
 
     job_queue = app.job_queue
     if job_queue:
-        job_queue.run_repeating(run_health_check, interval=3600, first=60)
+        job_queue.run_repeating(run_health_check, interval=3600, first=30)
+        # Стартовый пинг — сразу проверяем что алерты работают
+        async def startup_ping(context):
+            alert_chat = os.environ.get("ALERT_CHAT_ID", "")
+            if alert_chat:
+                import httpx
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                try:
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        await c.post(url, json={
+                            "chat_id": alert_chat,
+                            "text": "🤖 Аполлон запущен. Health-check активен — буду писать если что-то сломается."
+                        })
+                except Exception:
+                    pass
+        job_queue.run_once(startup_ping, when=5)
+    else:
+        print("⚠️ job_queue недоступен — установи python-telegram-bot[job-queue]")
 
     print("🤖 Бот запущен. Ctrl+C для остановки.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
