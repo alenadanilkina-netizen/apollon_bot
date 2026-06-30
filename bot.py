@@ -707,7 +707,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             transits_str = f"(транзиты недоступны: {e})"
 
-        solar_str = ""
+        extra_str = ""
         if query.data == "forecast_year":
             try:
                 solar_raw = await call_mcp_async("solar_return", {
@@ -718,12 +718,37 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "lat": birth["lat"], "lon": birth["lon"],
                     "return_year": today.year,
                 })
-                solar_str = "\n\nСОЛЯР (карта года):\n" + solar_raw.get("raw", str(solar_raw))
+                extra_str += "\n\nСОЛЯР (карта года):\n" + solar_raw.get("raw", str(solar_raw))
             except Exception as e:
-                solar_str = f"\n(соляр недоступен: {e})"
+                extra_str += f"\n(соляр недоступен: {e})"
+            try:
+                hd_raw = await call_mcp_async("hd_cycles", {
+                    "birth_year": birth["year"], "birth_month": birth["month"],
+                    "birth_day": birth["day"], "birth_hour": birth["hour"],
+                    "birth_minute": birth.get("minute", 0),
+                    "birth_timezone": birth["utc_offset"],
+                    "cycle_year": today.year,
+                })
+                extra_str += "\n\nHD-ЦИКЛЫ (ворота года):\n" + hd_raw.get("raw", str(hd_raw))
+            except Exception as e:
+                extra_str += f"\n(HD-циклы недоступны: {e})"
+
+        if query.data == "forecast_month":
+            try:
+                lunar_raw = await call_mcp_async("lunar_return", {
+                    "birth_year": birth["year"], "birth_month": birth["month"],
+                    "birth_day": birth["day"], "birth_hour": birth["hour"],
+                    "birth_minute": birth.get("minute", 0),
+                    "birth_timezone": birth["utc_offset"],
+                    "lat": birth["lat"], "lon": birth["lon"],
+                    "from_year": today.year, "from_month": today.month, "from_day": today.day,
+                })
+                extra_str += "\n\nЛУНАР (карта месяца):\n" + lunar_raw.get("raw", str(lunar_raw))
+            except Exception as e:
+                extra_str += f"\n(лунар недоступен: {e})"
 
         name = users[uid].get("name", "")
-        prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{get_forecast_prompt(query.data, transits_str + solar_str)}"
+        prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
         await query.message.reply_text("Смотрю что происходит на небе...")
         reply = await ask_claude(uid, prompt)
         await query.message.reply_text(reply, parse_mode="Markdown")

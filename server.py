@@ -487,6 +487,139 @@ def tool_solar_return(args):
     return "\n".join(lines)
 
 
+def tool_lunar_return(args):
+    """Лунар: карта момента, когда Луна возвращается в натальную позицию (~каждые 27.3 дня)"""
+    import datetime as dt
+    year   = int(args["birth_year"])
+    month  = int(args["birth_month"])
+    day    = int(args["birth_day"])
+    hour   = int(args["birth_hour"])
+    minute = int(args.get("birth_minute", 0))
+    tz     = float(args["birth_timezone"])
+    lat    = float(args["lat"])
+    lon    = float(args["lon"])
+
+    # Дата поиска: следующий лунар от указанной даты (по умолчанию — сегодня)
+    now = dt.datetime.utcnow()
+    from_year  = int(args.get("from_year",  now.year))
+    from_month = int(args.get("from_month", now.month))
+    from_day   = int(args.get("from_day",   now.day))
+
+    jd_natal = birth_to_jd(year, month, day, hour, minute, tz)
+    natal_moon = swe.calc_ut(jd_natal, swe.MOON, swe.FLG_SWIEPH)[0][0]
+
+    # Ищем следующий возврат Луны от заданной даты
+    jd_start = swe.julday(from_year, from_month, from_day, 0.0)
+    jd_lr = jd_start
+    for _ in range(200):
+        cur_moon = swe.calc_ut(jd_lr, swe.MOON, swe.FLG_SWIEPH)[0][0]
+        diff = (natal_moon - cur_moon + 180) % 360 - 180
+        if abs(diff) < 0.001:
+            break
+        jd_lr += diff / 13.2  # Луна ~13.2°/день
+
+    lr_planets = calc_planets(jd_lr, sidereal=False)
+    lr_cusps, lr_asc, lr_mc = calc_houses(jd_lr, lat, lon)
+
+    lr_date = swe.revjul(jd_lr)
+    lr_dt = f"{int(lr_date[2]):02d}.{int(lr_date[1]):02d}.{int(lr_date[0])}  {int(lr_date[3]):02d}:{int((lr_date[3]%1)*60):02d} UTC"
+
+    lines = ["═══ ЛУНАР: возвращение Луны ═══"]
+    lines.append(f"Точный момент: {lr_dt}")
+    lines.append(f"Место: {lat:.4f}°N  {lon:.4f}°E")
+    lines.append(f"Натальная Луна: {deg_to_sign(natal_moon)[0]} {deg_to_sign(natal_moon)[1]}°{deg_to_sign(natal_moon)[2]:02d}'")
+    lines.append("")
+    asc_sign, ad, am, _ = deg_to_sign(lr_asc)
+    mc_sign, md, mm, _  = deg_to_sign(lr_mc)
+    lines.append(f"АСЦ лунара: {asc_sign} {ad}°{am:02d}'   МС лунара: {mc_sign} {md}°{mm:02d}'")
+    lines.append("")
+    lines.append(f"{'Планета':<12} {'Знак':<13} {'Градус':<10} R")
+    lines.append("─"*42)
+    for pname, pdata in lr_planets.items():
+        sign, d, m, _ = deg_to_sign(pdata["lon"])
+        r = "℞" if pdata["retro"] else ""
+        lines.append(f"{pname:<12} {sign:<13} {d:2d}°{m:02d}'      {r}")
+
+    lines.append("")
+    lines.append("── НАЛОЖЕНИЕ НА НАТАЛЬНУЮ КАРТУ ──")
+    natal_planets = calc_planets(jd_natal, sidereal=False)
+    ASPECTS = [(0,"соединение",8),(60,"секстиль",5),(90,"квадрат",6),(120,"трин",7),(180,"оппозиция",7)]
+    lines.append(f"{'Лунар-планета':<14} {'→ Натальная':<14} {'Аспект'}")
+    lines.append("─"*50)
+    for spname, spdata in lr_planets.items():
+        for npname, npdata in natal_planets.items():
+            diff = abs(spdata["lon"] - npdata["lon"]) % 360
+            if diff > 180: diff = 360 - diff
+            for asp_deg, asp_name, orb in ASPECTS:
+                if abs(diff - asp_deg) <= orb:
+                    lines.append(f"{spname:<14} {npname:<14} {asp_name}")
+                    break
+
+    return "\n".join(lines)
+
+
+def tool_hd_cycles(args):
+    """HD-циклы на год: даты прохождения Солнца через все 64 ворота + активируемые каналы"""
+    import datetime as dt
+    year   = int(args["birth_year"])
+    month  = int(args["birth_month"])
+    day    = int(args["birth_day"])
+    hour   = int(args["birth_hour"])
+    minute = int(args.get("birth_minute", 0))
+    tz     = float(args["birth_timezone"])
+
+    now = dt.datetime.utcnow()
+    cycle_year = int(args.get("cycle_year", now.year))
+
+    jd_natal = birth_to_jd(year, month, day, hour, minute, tz)
+
+    # Натальные ворота (Личность + Дизайн)
+    jd_design = jd_natal - 88.0
+    natal_gates = set()
+    for planet_id, _ in PLANETS:
+        for jd in [jd_natal, jd_design]:
+            lon = swe.calc_ut(jd, planet_id, swe.FLG_SWIEPH)[0][0]
+            idx = int(lon / 5.625) % 64
+            natal_gates.add(HD_GATES_BY_DEGREE[idx])
+
+    # Проходим по дням года, фиксируем смену ворот Солнца
+    jd_start = swe.julday(cycle_year, 1, 1, 0.0)
+    jd_end   = swe.julday(cycle_year, 12, 31, 23.0)
+
+    lines = [f"═══ HD-ЦИКЛЫ {cycle_year}: Солнце через 64 ворота ═══", ""]
+    lines.append("Солнце проводит в каждых воротах ~5.6 дней.")
+    lines.append("★ = канал активируется с натальными воротами (энергетический импульс)")
+    lines.append("")
+
+    prev_gate = None
+    jd = jd_start
+    while jd <= jd_end:
+        lon = swe.calc_ut(jd, swe.SUN, swe.FLG_SWIEPH)[0][0]
+        idx = int(lon / 5.625) % 64
+        gate = HD_GATES_BY_DEGREE[idx]
+        if gate != prev_gate:
+            d = swe.revjul(jd)
+            date_str = f"{int(d[2]):02d}.{int(d[1]):02d}"
+            # Проверяем активируется ли канал
+            channel_note = ""
+            for ga, gb in CHANNELS:
+                partner = None
+                if ga == gate and gb in natal_gates:
+                    partner = gb
+                elif gb == gate and ga in natal_gates:
+                    partner = ga
+                if partner:
+                    channel_note = f"  ★ канал {gate}-{partner}"
+                    break
+            lines.append(f"{date_str}  Ворота {gate:>2}{channel_note}")
+            prev_gate = gate
+        jd += 0.25  # шаг 6 часов для точности смены ворот
+
+    lines.append("")
+    lines.append(f"Натальные ворота: {sorted(natal_gates)}")
+    return "\n".join(lines)
+
+
 def tool_transits(args):
     """Текущие транзиты относительно натальной карты"""
     # Натальная карта
@@ -602,6 +735,44 @@ TOOLS_SCHEMA = [
         }
     },
     {
+        "name": "lunar_return",
+        "description": "Лунар — карта момента возвращения Луны в натальную позицию (~каждые 27.3 дня). Основа месячного прогноза. Показывает планеты лунара и аспекты к натальным.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "birth_year":    {"type":"integer"},
+                "birth_month":   {"type":"integer"},
+                "birth_day":     {"type":"integer"},
+                "birth_hour":    {"type":"integer"},
+                "birth_minute":  {"type":"integer","default":0},
+                "birth_timezone":{"type":"number"},
+                "lat":           {"type":"number"},
+                "lon":           {"type":"number"},
+                "from_year":     {"type":"integer","description":"Искать лунар начиная с этого года (по умолчанию текущий)"},
+                "from_month":    {"type":"integer","description":"Месяц начала поиска"},
+                "from_day":      {"type":"integer","description":"День начала поиска"},
+            },
+            "required":["birth_year","birth_month","birth_day","birth_hour","birth_timezone","lat","lon"]
+        }
+    },
+    {
+        "name": "hd_cycles",
+        "description": "HD-циклы на год: даты когда Солнце проходит через все 64 ворота Дизайна Человека + отмечает какие каналы активируются с натальными воротами человека.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "birth_year":    {"type":"integer"},
+                "birth_month":   {"type":"integer"},
+                "birth_day":     {"type":"integer"},
+                "birth_hour":    {"type":"integer"},
+                "birth_minute":  {"type":"integer","default":0},
+                "birth_timezone":{"type":"number"},
+                "cycle_year":    {"type":"integer","description":"Год циклов (по умолчанию текущий)"},
+            },
+            "required":["birth_year","birth_month","birth_day","birth_hour","birth_timezone"]
+        }
+    },
+    {
         "name": "transits",
         "description": "Посмотреть текущие транзиты планет относительно натальной карты — аспекты транзитных планет к натальным.",
         "inputSchema": {
@@ -628,6 +799,8 @@ TOOL_HANDLERS = {
     "natal_chart":   tool_natal_chart,
     "human_design":  tool_human_design,
     "solar_return":  tool_solar_return,
+    "lunar_return":  tool_lunar_return,
+    "hd_cycles":     tool_hd_cycles,
     "transits":      tool_transits,
 }
 
