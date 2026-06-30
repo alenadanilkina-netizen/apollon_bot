@@ -431,6 +431,41 @@ def tool_human_design(args):
     lines.append(f"НЕ-Я ТЕМА:  {NOT_SELF.get(hd_type,'—')}")
     lines.append(f"ПРОФИЛЬ:     {profile} — {profile_name}")
     lines.append("")
+
+    # Переменные (4 стрелки) — линии 1-3 = Левая (активная/ян), 4-6 = Правая (пассивная/инь)
+    VARIABLES = {
+        # (сторона, название, значение для L, значение для R)
+        "arrow1": ("Голова",    "Питание/Детерминация",
+                   "Аппетит (активное, последовательное)", "Вкус (пассивное, избирательное)"),
+        "arrow2": ("Аджна",     "Среда/Окружение",
+                   "Активная среда (движение, разнообразие)", "Пассивная среда (постоянство, уют)"),
+        "arrow3": ("Горло",     "Мотивация/Перспектива",
+                   "Надежда/Вина (смотрит вперёд)", "Страх/Невинность (смотрит назад)"),
+        "arrow4": ("G-центр",   "Взгляд/Когниция",
+                   "Обоснование (активное понимание)", "Восприятие (пассивное созерцание)"),
+    }
+    ps_line = con_gates.get("Солнце", {}).get("line", 0)
+    ds_line = unc_gates.get("Солнце", {}).get("line", 0)
+    pe_line = con_gates.get("Земля", {}).get("line", 0)
+    de_line = unc_gates.get("Земля", {}).get("line", 0)
+
+    arrow_lines = [ps_line, ds_line, pe_line, de_line]
+    arrow_keys  = ["arrow1", "arrow2", "arrow3", "arrow4"]
+    var_parts = []
+    arrow_symbols = []
+    for i, (key, aline) in enumerate(zip(arrow_keys, arrow_lines)):
+        center, name_v, left_val, right_val = VARIABLES[key]
+        side = "Левая →" if aline <= 3 else "← Правая"
+        val  = left_val if aline <= 3 else right_val
+        var_parts.append(f"  {center} ({name_v}): {side} — {val}")
+        arrow_symbols.append("→" if aline <= 3 else "←")
+
+    lines.append("ПЕРЕМЕННЫЕ (4 стрелки):")
+    lines.append(f"  Стрелки: {' '.join(arrow_symbols)}  (Голова | Аджна | Горло | G-центр)")
+    for v in var_parts:
+        lines.append(v)
+    lines.append("")
+
     lines.append(f"ОПРЕДЕЛЁННЫЕ ЦЕНТРЫ ({len(defined_centers)}):")
     lines.append("  " + ", ".join(defined_centers) if defined_centers else "  нет")
     lines.append("")
