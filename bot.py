@@ -29,7 +29,7 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 from anthropic import Anthropic
-from hd_library import get_hd_context, get_cross_context
+from hd_library import get_hd_context, get_cross_context, get_love_context
 
 # ─── КОНФИГ ──────────────────────────────────────────────────────────────────
 
@@ -820,6 +820,14 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cross_ctx = get_cross_context(hd)
             if cross_ctx:
                 full_prompt += f"\n\nКРЕСТ ВОПЛОЩЕНИЯ (описания из HD библиотеки):\n{cross_ctx}"
+
+    # Для блока отношений добавляем ворота любви из Love Book
+    if query.data == "block_love" and uid in users:
+        hd = users[uid].get("hd", {})
+        if hd:
+            love_ctx = get_love_context(hd)
+            if love_ctx:
+                full_prompt += f"\n\nВОРОТА ЛЮБВИ (из Love Book Ra Uru Hu):\n{love_ctx}"
 
     try:
         await query.message.reply_text("Смотрю в карту...")

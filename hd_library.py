@@ -106,6 +106,93 @@ def _build_types_index() -> dict:
     return index
 
 
+# ─── КНИГА ЛЮБВИ ─────────────────────────────────────────────────────────────
+
+# Ворота любви из Love Book (Ra Uru Hu)
+# Анти-мундан (G-центр): 25, 15, 46, 10(трансцендентный)
+# Мундан (личные): 10, 44, 40, 58, 41, 28, 55
+LOVE_GATES = {25, 15, 46, 10, 44, 40, 58, 41, 28, 55}
+
+@lru_cache(maxsize=1)
+def _build_love_index() -> dict:
+    """
+    Строит индекс ворот любви из hd_love_book.txt.
+    Возвращает {gate_num: excerpt} — ключевые абзацы о каждых воротах.
+    """
+    text = _load('hd_love_book.txt')
+    index = {}
+
+    # Паттерны заголовков в книге: "Gate 25", "Gate 44" и т.д.
+    gate_pattern = re.compile(
+        r'(?:Gate|gate)\s+(\d+)[^\n]{0,60}\n(.*?)(?=(?:Gate|gate)\s+\d+|===|$)',
+        re.DOTALL
+    )
+    for m in gate_pattern.finditer(text):
+        gn = int(m.group(1))
+        if gn in LOVE_GATES:
+            excerpt = m.group(2).strip()[:1200]
+            if gn not in index:
+                index[gn] = excerpt
+            else:
+                index[gn] += "\n" + excerpt[:400]
+
+    return index
+
+
+def get_love_context(hd_data: dict) -> str:
+    """
+    Возвращает описания ворот любви из Love Book для ворот, присутствующих в карте.
+    """
+    raw = hd_data.get('raw', '')
+    if not raw:
+        return ''
+
+    love_idx = _build_love_index()
+    gates_idx = _build_gates_index()
+
+    # Найти все ворота в карте пользователя
+    gate_pattern = re.compile(r'Ворота\s+(\d+)\.(\d+)')
+    user_gates = {int(m.group(1)) for m in gate_pattern.finditer(raw)}
+
+    # Ворота любви которые есть в карте
+    present_love_gates = user_gates & LOVE_GATES
+
+    sections = []
+
+    # Каналы любви (37-40, 59-6, 19-49 — племенные; 44-26, 29-46 и др.)
+    LOVE_CHANNELS = {(37, 40), (59, 6), (19, 49), (44, 26), (29, 46), (41, 30)}
+    channels_match = re.search(r'КАНАЛЫ[^\n]*:\n(.*?)(?=СОЗНАТЕЛЬНЫЕ|БЕССОЗНАТЕЛЬНЫЕ|КРЕСТ|$)', raw, re.DOTALL)
+    present_channels = set()
+    if channels_match:
+        for line in channels_match.group(1).strip().split('\n'):
+            m = re.match(r'(\d+)-(\d+)', line.strip())
+            if m:
+                ch = (int(m.group(1)), int(m.group(2)))
+                if ch in LOVE_CHANNELS or (ch[1], ch[0]) in LOVE_CHANNELS:
+                    present_channels.add(ch)
+
+    if present_love_gates or present_channels:
+        parts = []
+        for gn in sorted(present_love_gates):
+            love_text = love_idx.get(gn, '')
+            gate_data = gates_idx.get(gn, {})
+            gate_full = gate_data.get('full', '')[:200]
+            entry = f"Ворота {gn} (любовь):"
+            if gate_full:
+                entry += f"\n  Суть: {gate_full}"
+            if love_text:
+                entry += f"\n  Из Love Book: {love_text[:600]}"
+            parts.append(entry)
+
+        if present_channels:
+            parts.append(f"Каналы отношений в карте: {', '.join(f'{a}-{b}' for a,b in present_channels)}")
+
+        if parts:
+            sections.append("=== ВОРОТА ЛЮБВИ (из Love Book Ra Uru Hu) ===\n" + '\n\n'.join(parts))
+
+    return '\n\n'.join(sections)
+
+
 # ─── КРЕСТ ВОПЛОЩЕНИЯ ────────────────────────────────────────────────────────
 
 def get_cross_context(hd_data: dict) -> str:
