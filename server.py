@@ -260,12 +260,32 @@ def tool_natal_chart(args):
         house = get_house_num(pdata["lon"], cusps)
         r = "℞" if pdata["retro"] else ""
         lines.append(f"{pname:<12} {sign:<13} {d:2d}°{m:02d}'     {house:<5} {r}")
-    # Куспиды домов для призвания
+    # Лилит (Чёрная Луна) и Хирон — добавляем отдельно с обработкой отсутствия файлов
+    try:
+        lilith_r = swe.calc_ut(jd, swe.MEAN_APOG, swe.FLG_SWIEPH)[0]
+        lilith_lon = lilith_r[0]
+        l_sign, l_d, l_m, _ = deg_to_sign(lilith_lon)
+        l_house = get_house_num(lilith_lon, cusps)
+        lines.append(f"{'Лилит':<12} {l_sign:<13} {l_d:2d}°{l_m:02d}'     {l_house:<5} ")
+    except Exception:
+        pass
+    try:
+        chiron_r = swe.calc_ut(jd, swe.CHIRON, swe.FLG_SWIEPH)[0]
+        ch_lon = chiron_r[0]
+        ch_sign, ch_d, ch_m, _ = deg_to_sign(ch_lon)
+        ch_house = get_house_num(ch_lon, cusps)
+        lines.append(f"{'Хирон':<12} {ch_sign:<13} {ch_d:2d}°{ch_m:02d}'     {ch_house:<5} ")
+    except Exception:
+        pass
+    # Куспиды ключевых домов (отношения + призвание)
     lines.append("")
     lines.append("КЛЮЧЕВЫЕ ДОМА:")
-    for h_num in [2, 6, 8, 10, 12]:
+    for h_num in [2, 5, 6, 7, 8, 10, 12]:
         sign, d, m, _ = deg_to_sign(cusps[h_num - 1])
-        lines.append(f"  {h_num}-й дом: {sign} {d}°{m:02d}'")
+        # Планеты в этом доме
+        planets_in = [pn for pn, pd in trop.items() if get_house_num(pd["lon"], cusps) == h_num]
+        extra = f" (планеты: {', '.join(planets_in)})" if planets_in else ""
+        lines.append(f"  {h_num}-й дом: {sign} {d}°{m:02d}'{extra}")
 
     lines.append("")
     lines.append(f"── ДЖЙОТИШ (Сидерический, Лахири, айанамша {ayanamsha:.2f}°) ──")
