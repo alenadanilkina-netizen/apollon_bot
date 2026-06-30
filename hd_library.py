@@ -141,50 +141,34 @@ def get_hd_context(hd_data: dict) -> str:
                 sections.append(f"=== АВТОРИТЕТ: {authority} ===\n{val}")
                 break
 
-    # ── Определённые центры ──
-    centers_block = re.search(r'ОПРЕДЕЛЁННЫЕ ЦЕНТРЫ[^\n]*:\n(.*?)(?=НЕОПРЕДЕЛЁННЫЕ|КАНАЛЫ|$)', raw, re.DOTALL)
-    undef_block = re.search(r'НЕОПРЕДЕЛЁННЫЕ ЦЕНТРЫ[^\n]*:\n(.*?)(?=КАНАЛЫ|СОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+    # ── Парсим ворота с планетами (для синтеза) ──
+    # Формат: "Солнце       Ворота 55.5   Рыбы 4°39'"
+    planet_gate_pattern = re.compile(
+        r'(Солнце|Земля|Луна|Меркурий|Венера|Марс|Юпитер|Сатурн|Уран|Нептун|Плутон|С\.Узел|Ю\.Узел)'
+        r'\s+Ворота\s+(\d+)\.(\d+)',
+        re.IGNORECASE
+    )
+    # Собираем: {gate_num: [(planet, line, is_conscious)]}
+    gate_planets = {}
+    conscious_section = re.search(r'СОЗНАТЕЛЬНЫЕ ВОРОТА.*?:(.*?)(?=БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+    unconscious_section = re.search(r'БЕССОЗНАТЕЛЬНЫЕ ВОРОТА.*?:(.*?)$', raw, re.DOTALL)
 
-    centers_idx = _build_centers_index()
-    defined_centers = []
-    undefined_centers = []
+    for section_text, is_conscious in [
+        (conscious_section.group(1) if conscious_section else '', True),
+        (unconscious_section.group(1) if unconscious_section else '', False)
+    ]:
+        for m in planet_gate_pattern.finditer(section_text):
+            planet = m.group(1)
+            gate_num = int(m.group(2))
+            line_num = int(m.group(3))
+            if gate_num not in gate_planets:
+                gate_planets[gate_num] = []
+            gate_planets[gate_num].append((planet, line_num, is_conscious))
 
-    if centers_block:
-        for line in centers_block.group(1).strip().split('\n'):
-            c = line.strip().lstrip('·•- ')
-            if c:
-                defined_centers.append(c)
-
-    if undef_block:
-        for line in undef_block.group(1).strip().split('\n'):
-            c = line.strip().lstrip('·•- ')
-            if c:
-                undefined_centers.append(c)
-
-    center_texts = []
-    for c in defined_centers:
-        for key, val in centers_idx.items():
-            if c.lower() in key.lower() or key.lower() in c.lower():
-                # Берём только блок "Определённый"
-                defined_part = re.search(r'\*\*Определённый[^\*]*\*\*[:\s]*(.*?)(?=\*\*|$)', val, re.DOTALL)
-                text = defined_part.group(1).strip()[:400] if defined_part else val[:400]
-                center_texts.append(f"Центр {c} (определённый): {text}")
-                break
-
-    for c in undefined_centers:
-        for key, val in centers_idx.items():
-            if c.lower() in key.lower() or key.lower() in c.lower():
-                open_part = re.search(r'\*\*Открытый[^\*]*\*\*[:\s]*(.*?)(?=\*\*|$)', val, re.DOTALL)
-                text = open_part.group(1).strip()[:400] if open_part else val[:400]
-                center_texts.append(f"Центр {c} (открытый): {text}")
-                break
-
-    if center_texts:
-        sections.append("=== ЦЕНТРЫ ===\n" + '\n\n'.join(center_texts))
-
-    # ── Каналы ──
+    # ── Каналы — синтез с планетами и контуром ──
     channels_match = re.search(r'КАНАЛЫ[^\n]*:\n(.*?)(?=СОЗНАТЕЛЬНЫЕ|БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
     channels_idx = _build_channels_index()
+    gates_idx = _build_gates_index()
     channel_texts = []
 
     if channels_match:
@@ -193,33 +177,76 @@ def get_hd_context(hd_data: dict) -> str:
             m = re.match(r'(\d+)-(\d+)', line)
             if m:
                 a, b = int(m.group(1)), int(m.group(2))
-                desc = channels_idx.get((a, b)) or channels_idx.get((b, a))
-                if desc:
-                    channel_texts.append(desc)
+                desc = channels_idx.get((a, b)) or channels_idx.get((b, a)) or ''
+
+                # Планеты активирующие каждые ворота канала
+                gate_info_parts = []
+                for gate_num in [a, b]:
+                    planets_for_gate = gate_planets.get(gate_num, [])
+                    if planets_for_gate:
+                        for planet, line_num, is_conscious in planets_for_gate:
+                            kind = 'сознательные' if is_conscious else 'бессознательные'
+                            # Описание линии из Line Companion
+                            gate_data = gates_idx.get(gate_num, {})
+                            line_text = gate_data.get('lines', {}).get(line_num, '')[:300]
+                            gate_info_parts.append(
+                                f"  Ворота {gate_num}.{line_num} [{kind}] активирует {planet}:\n  {line_text}"
+                            )
+
+                channel_block = f"{desc}"
+                if gate_info_parts:
+                    channel_block += "\n" + "\n".join(gate_info_parts)
+                channel_texts.append(channel_block)
 
     if channel_texts:
-        sections.append("=== КАНАЛЫ ===\n" + '\n\n'.join(channel_texts))
+        sections.append("=== КАНАЛЫ (синтез: канал → ворота → планета → линия) ===\n" + '\n\n'.join(channel_texts))
 
-    # ── Ворота (сознательные + бессознательные) ──
-    gates_idx = _build_gates_index()
-    gate_texts = []
-    seen_gates = set()
+    # ── Одиночные ворота (не входящие в каналы) — только Солнце и Луна ──
+    # Это самые важные ворота для личности
+    channels_gates = set()
+    if channels_match:
+        for line in channels_match.group(1).strip().split('\n'):
+            m = re.match(r'(\d+)-(\d+)', line.strip())
+            if m:
+                channels_gates.add(int(m.group(1)))
+                channels_gates.add(int(m.group(2)))
 
-    gate_pattern = re.compile(r'Ворота\s+(\d+)\.(\d+)', re.IGNORECASE)
-    for m in gate_pattern.finditer(raw):
-        gate_num = int(m.group(1))
-        line_num = int(m.group(2))
-        if gate_num in seen_gates:
+    key_planets = {'Солнце', 'Луна', 'Земля'}
+    solo_gate_texts = []
+    seen = set()
+    for gate_num, planet_list in gate_planets.items():
+        if gate_num in channels_gates:
             continue
-        seen_gates.add(gate_num)
+        for planet, line_num, is_conscious in planet_list:
+            if planet in key_planets and gate_num not in seen:
+                seen.add(gate_num)
+                kind = 'сознательные' if is_conscious else 'бессознательные'
+                gate_data = gates_idx.get(gate_num, {})
+                line_text = gate_data.get('lines', {}).get(line_num, '')[:350]
+                solo_gate_texts.append(
+                    f"Ворота {gate_num}.{line_num} ({planet}, {kind}):\n{line_text}"
+                )
 
-        gate_data = gates_idx.get(gate_num, {})
-        line_text = gate_data.get('lines', {}).get(line_num) or gate_data.get('full', '')
-        if line_text:
-            gate_texts.append(f"Ворота {gate_num}.{line_num}: {line_text[:400]}")
+    if solo_gate_texts:
+        sections.append("=== КЛЮЧЕВЫЕ ОДИНОЧНЫЕ ВОРОТА (Солнце/Луна/Земля) ===\n" + '\n\n'.join(solo_gate_texts))
 
-    if gate_texts:
-        sections.append("=== ВОРОТА ===\n" + '\n\n'.join(gate_texts[:20]))  # max 20 ворот
+    # ── Открытые центры (уязвимости и мудрость) ──
+    undef_block = re.search(r'НЕОПРЕДЕЛЁННЫЕ ЦЕНТРЫ[^\n]*:\n(.*?)(?=КАНАЛЫ|СОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+    centers_idx = _build_centers_index()
+    undef_texts = []
+    if undef_block:
+        for c in undef_block.group(1).strip().split('\n'):
+            c = c.strip().lstrip('·•- ')
+            if not c:
+                continue
+            for key, val in centers_idx.items():
+                if c.lower() in key.lower() or key.lower() in c.lower():
+                    open_part = re.search(r'\*\*Открытый[^\*]*\*\*[:\s]*(.*?)(?=\*\*|$)', val, re.DOTALL)
+                    text = open_part.group(1).strip()[:350] if open_part else val[:350]
+                    undef_texts.append(f"Открытый центр {c}: {text}")
+                    break
+    if undef_texts:
+        sections.append("=== ОТКРЫТЫЕ ЦЕНТРЫ (уязвимости и потенциальная мудрость) ===\n" + '\n\n'.join(undef_texts))
 
     return '\n\n'.join(sections)
 
