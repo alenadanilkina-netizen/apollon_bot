@@ -37,7 +37,13 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MCP_SERVER = Path(__file__).parent / "server.py"
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
-DB_PATH = Path(__file__).parent / "users.db"
+# Railway Volume: если есть /data — используем его (персистентный диск)
+# Иначе fallback к локальному файлу (разработка)
+_DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+if _DATA_DIR.exists() and os.access(_DATA_DIR, os.W_OK):
+    DB_PATH = _DATA_DIR / "users.db"
+else:
+    DB_PATH = Path(__file__).parent / "users.db"
 
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────────────────────
 
@@ -751,11 +757,16 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     uid = query.from_user.id
 
+    # Кнопки которые работают без активной сессии
+    NO_SESSION_NEEDED = {"full_reading", "back_to_menu", "free_chat", "forecast_menu"}
+
     # Восстанавливаем сессию если бот перезапустился
-    if uid not in users and query.data not in ("full_reading", "back_to_menu"):
+    if uid not in users and query.data not in NO_SESSION_NEEDED:
         restored = await restore_session(uid, query.message)
         if not restored:
-            await query.message.reply_text("Сессия не найдена. Напиши /start чтобы начать.")
+            await query.message.reply_text(
+                "Бот перезапустился и потерял твою карту. Напиши /start — пересчитаем за секунду."
+            )
             return
 
     if query.data == "full_reading":
