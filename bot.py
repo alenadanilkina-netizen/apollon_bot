@@ -154,11 +154,30 @@ def call_mcp(tool: str, params: dict) -> dict:
         [sys.executable, str(MCP_SERVER)],
         input=request.encode('utf-8'), capture_output=True, timeout=30
     )
+    stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
     if result.returncode != 0:
-        raise RuntimeError(f"MCP error: {result.stderr.decode('utf-8', errors='replace')}")
-    response = json.loads(result.stdout.decode('utf-8'))
+        raise RuntimeError(f"MCP {tool} returncode={result.returncode}: {stderr_text[:500]}")
+    stdout_text = result.stdout.decode('utf-8').strip()
+    if not stdout_text:
+        raise RuntimeError(f"MCP {tool} вернул пустой ответ. stderr: {stderr_text[:300]}")
+    # сервер может выводить несколько строк — берём последнюю непустую с JSON
+    response = None
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+    if response is None:
+        raise RuntimeError(f"MCP {tool} не вернул JSON. stdout: {stdout_text[:300]}")
+    if "error" in response:
+        err_msg = response["error"].get("message", str(response["error"]))
+        raise RuntimeError(f"MCP {tool} error: {err_msg}")
     content = response.get("result", {}).get("content", [{}])
     text = content[0].get("text", "") if content else ""
+    if not text:
+        raise RuntimeError(f"MCP {tool} вернул пустой content. response: {str(response)[:300]}")
     return json.loads(text) if text.startswith("{") else {"raw": text}
 
 async def call_mcp_async(tool: str, params: dict) -> dict:
@@ -166,6 +185,9 @@ async def call_mcp_async(tool: str, params: dict) -> dict:
 
 async def calculate_chart(birth: dict) -> tuple[dict, dict]:
     """Считает натальную карту и HD (async)"""
+    print(f"DEBUG calculate_chart: year={birth.get('year')} month={birth.get('month')} day={birth.get('day')} "
+          f"hour={birth.get('hour')} minute={birth.get('minute')} tz={birth.get('utc_offset')} "
+          f"lat={birth.get('lat')} lon={birth.get('lon')}")
     natal, hd = await asyncio.gather(
         call_mcp_async("natal_chart", {
             "year": birth["year"], "month": birth["month"], "day": birth["day"],
@@ -580,7 +602,8 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         import traceback
-        print(f"ERROR in ask_place: {traceback.format_exc()}")
+        err = traceback.format_exc()
+        print(f"ERROR in ask_place: {err}")
         await update.message.reply_text(
             "Упс... Посейдон разлил воду и всё немного сломалось. "
             "Боги уже чинят. Попробуй написать /start чтобы начать заново."
