@@ -92,14 +92,20 @@ def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str
 def db_load_user(tg_id: int) -> dict | None:
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
-        "SELECT name, birth_day, birth_month, birth_year, birth_hour, birth_minute, city FROM users WHERE tg_id=?",
+        "SELECT name, birth_day, birth_month, birth_year, birth_hour, birth_minute, city, blocks_seen FROM users WHERE tg_id=?",
         (tg_id,)
     ).fetchone()
     con.close()
     if not row or not row[1]:
         return None
-    name, d, m, y, h, mi, city = row
-    return {"name": name, "birth": {"day": d, "month": m, "year": y, "hour": h, "minute": mi or 0, "city": city or ""}}
+    name, d, m, y, h, mi, city, blocks_json = row
+    blocks_seen = json.loads(blocks_json or "[]")
+    return {
+        "name": name,
+        "birth": {"day": d, "month": m, "year": y, "hour": h, "minute": mi or 0, "city": city or ""},
+        "blocks_seen": blocks_seen,
+        "menu_shown": len(blocks_seen) > 0,  # если уже были блоки — меню уже показывали
+    }
 
 def db_add_block(tg_id: int, block: str):
     con = sqlite3.connect(DB_PATH)
@@ -270,18 +276,40 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
     user = users.get(user_id, {})
     history = user.get("history", [])
 
+    BLOCK_NAMES = {
+        "block_identity":  "Характер и таланты",
+        "block_mission":   "Предназначение",
+        "block_love":      "Отношения",
+        "block_money":     "Деньги",
+        "block_health":    "Здоровье",
+        "block_resources": "Ресурсы",
+    }
+
     context = ""
     if user.get("chart") or user.get("hd"):
         chart = user.get("chart", {})
         hd = user.get("hd", {})
         chart_str = chart.get("raw", json.dumps(chart, ensure_ascii=False))
         hd_str = hd.get("raw", json.dumps(hd, ensure_ascii=False))
-        # Вытаскиваем релевантные описания из библиотеки HD
         hd_library_context = get_hd_context(hd)
+
+        # Блоки которые уже были разобраны
+        seen_blocks = user.get("blocks_seen", [])
+        if seen_blocks:
+            seen_names = [BLOCK_NAMES.get(b, b) for b in seen_blocks]
+            blocks_note = (
+                f"\n\nУЖЕ РАЗОБРАНЫ БЛОКИ: {', '.join(seen_names)}. "
+                f"Не повторяй информацию из этих блоков — она уже известна пользователю. "
+                f"Если тема пересекается, можно сослаться одним предложением и идти дальше."
+            )
+        else:
+            blocks_note = ""
+
         context = (
             f"\n\nКАРТА ПОЛЬЗОВАТЕЛЯ (астрология):\n{chart_str}"
             f"\n\nHD ПОЛЬЗОВАТЕЛЯ (сырые данные):\n{hd_str}"
             f"\n\nHD БИБЛИОТЕКА (описания типа, авторитета, центров, каналов, ворот):\n{hd_library_context}"
+            f"{blocks_note}"
         )
 
     history.append({"role": "user", "content": message + context if not history else message})
@@ -996,6 +1024,11 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     name = users[uid].get("name", "")
     db_add_block(uid, query.data)
+    # обновляем в памяти чтобы следующий блок знал что уже разобрано
+    if "blocks_seen" not in users[uid]:
+        users[uid]["blocks_seen"] = []
+    if query.data not in users[uid]["blocks_seen"]:
+        users[uid]["blocks_seen"].append(query.data)
     full_prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{prompt}"
 
     # Для блока призвания добавляем контекст Креста воплощения
@@ -1034,7 +1067,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Боги уже разбираются. Попробуй нажать кнопку ещё раз или напиши /start."
         )
         return CHAT
-    await query.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
+    await query.message.reply_text("Выбери следующую тему:", reply_markup=MENU_KEYBOARD)
     users[uid]["menu_shown"] = True
     return CHAT
 
@@ -1154,18 +1187,18 @@ HD {name2}: {hd2_str}
 
                 reply = await ask_claude(uid, prompt)
                 await update.message.reply_text(reply, parse_mode="Markdown")
-                await update.message.reply_text("Что ещё исследуем у богов?", reply_markup=MENU_KEYBOARD)
+                await update.message.reply_text("Выбери следующую тему:", reply_markup=MENU_KEYBOARD)
                 users[uid]["menu_shown"] = True
             except Exception as e:
-                await update.message.reply_text(f"Что-то пошло не так. ({e})")
+                print(f"ERROR compat: {e}")
+                await update.message.reply_text("Упс... Посейдон разлил воду. Попробуй ещё раз.")
             return CHAT
 
     reply = await ask_claude(uid, user_text)
     await update.message.reply_text(reply, parse_mode="Markdown")
 
-    # Показываем меню только если Claude не задал вопрос в конце
-    ends_with_question = reply.strip().endswith("?")
-    if not users[uid].get("menu_shown") and not ends_with_question:
+    # Показываем меню только если это первый раз (menu_shown не установлен)
+    if not users[uid].get("menu_shown"):
         users[uid]["menu_shown"] = True
         await update.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
 
