@@ -31,11 +31,17 @@ from telegram.ext import (
 from anthropic import Anthropic
 from hd_library import get_hd_context, get_cross_context, get_love_context, get_phs_context, get_profile_context
 
+# Импортируем MCP-сервер напрямую (надёжнее чем subprocess)
+import importlib.util as _ilu
+_mcp_spec = _ilu.spec_from_file_location("mcp_server", Path(__file__).parent / "server.py")
+_mcp_mod  = _ilu.module_from_spec(_mcp_spec)
+_mcp_spec.loader.exec_module(_mcp_mod)
+TOOL_HANDLERS = _mcp_mod.TOOL_HANDLERS
+
 # ─── КОНФИГ ──────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MCP_SERVER = Path(__file__).parent / "server.py"
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 # Railway Volume: если есть /data — используем его (персистентный диск)
 # Иначе fallback к локальному файлу (разработка)
@@ -143,42 +149,14 @@ METHODOLOGY = load_methodology()
 # ─── MCP-РАСЧЁТ КАРТЫ ────────────────────────────────────────────────────────
 
 def call_mcp(tool: str, params: dict) -> dict:
-    """Вызывает MCP-сервер напрямую через JSON-RPC"""
-    request = json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool, "arguments": params}
-    })
-    result = subprocess.run(
-        [sys.executable, str(MCP_SERVER)],
-        input=request.encode('utf-8'), capture_output=True, timeout=30
-    )
-    stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
-    if result.returncode != 0:
-        raise RuntimeError(f"MCP {tool} returncode={result.returncode}: {stderr_text[:500]}")
-    stdout_text = result.stdout.decode('utf-8').strip()
-    if not stdout_text:
-        raise RuntimeError(f"MCP {tool} вернул пустой ответ. stderr: {stderr_text[:300]}")
-    # сервер может выводить несколько строк — берём последнюю непустую с JSON
-    response = None
-    for line in stdout_text.splitlines():
-        line = line.strip()
-        if line.startswith('{'):
-            try:
-                response = json.loads(line)
-            except json.JSONDecodeError:
-                pass
-    if response is None:
-        raise RuntimeError(f"MCP {tool} не вернул JSON. stdout: {stdout_text[:300]}")
-    if "error" in response:
-        err_msg = response["error"].get("message", str(response["error"]))
-        raise RuntimeError(f"MCP {tool} error: {err_msg}")
-    content = response.get("result", {}).get("content", [{}])
-    text = content[0].get("text", "") if content else ""
+    """Вызывает MCP-инструмент напрямую (без subprocess)"""
+    handler = TOOL_HANDLERS.get(tool)
+    if handler is None:
+        raise RuntimeError(f"Неизвестный MCP инструмент: {tool}")
+    text = handler(params)
     if not text:
-        raise RuntimeError(f"MCP {tool} вернул пустой content. response: {str(response)[:300]}")
-    return json.loads(text) if text.startswith("{") else {"raw": text}
+        raise RuntimeError(f"MCP {tool} вернул пустой ответ")
+    return json.loads(text) if isinstance(text, str) and text.startswith("{") else {"raw": text}
 
 async def call_mcp_async(tool: str, params: dict) -> dict:
     return await asyncio.to_thread(call_mcp, tool, params)
