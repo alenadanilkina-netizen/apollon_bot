@@ -10,6 +10,7 @@ import asyncio
 import subprocess
 import sys
 import sqlite3
+import hashlib
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -1395,8 +1396,23 @@ def main():
     else:
         print("⚠️ job_queue недоступен — установи python-telegram-bot[job-queue]")
 
-    print("🤖 Бот запущен. Ctrl+C для остановки.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    webhook_base_url = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+    if webhook_base_url:
+        # Webhook eliminates competing getUpdates requests. The URL path is
+        # derived from the bot token without exposing the token itself.
+        webhook_path = "telegram/" + hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()
+        print("🤖 Бот запущен в webhook-режиме.")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", "8080")),
+            url_path=webhook_path,
+            webhook_url=f"{webhook_base_url}/{webhook_path}",
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        print("🤖 Бот запущен в polling-режиме. Ctrl+C для остановки.")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
