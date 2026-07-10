@@ -1397,6 +1397,8 @@ def main():
         print("⚠️ job_queue недоступен — установи python-telegram-bot[job-queue]")
 
     webhook_base_url = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+    if not webhook_base_url and os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        webhook_base_url = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
     if webhook_base_url:
         # Webhook eliminates competing getUpdates requests. The URL path is
         # derived from the bot token without exposing the token itself.
