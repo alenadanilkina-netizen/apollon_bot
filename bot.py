@@ -53,7 +53,7 @@ COMPATIBLE_BASE_URL = os.environ.get("COMPATIBLE_BASE_URL", "")
 COMPATIBLE_MODEL = os.environ.get("COMPATIBLE_MODEL", "")
 AI_PROVIDER_ORDER = [
     item.strip().lower()
-    for item in os.environ.get("AI_PROVIDER_ORDER", "openai,anthropic,compatible").split(",")
+    for item in os.environ.get("AI_PROVIDER_ORDER", "anthropic,openai,compatible").split(",")
     if item.strip()
 ]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
