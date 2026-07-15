@@ -402,16 +402,44 @@ async def ask_ai(user_id: int, message: str) -> str:
     return await asyncio.to_thread(_ask_ai_sync, user_id, message)
 
 
+TELEGRAM_TEXT_CHUNK_SIZE = 3800
+
+
+def split_telegram_text(text: str, limit: int = TELEGRAM_TEXT_CHUNK_SIZE) -> list[str]:
+    """Делит длинный ответ по абзацам, не превышая лимит Telegram."""
+    remaining = (text or "").strip()
+    chunks: list[str] = []
+
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit + 1)
+        if cut < limit // 2:
+            cut = remaining.rfind("\n", 0, limit + 1)
+        if cut < limit // 2:
+            cut = remaining.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 async def send_ai_reply(message, text: str):
-    """Повторяет отправку без Markdown, если Telegram не разобрал разметку AI."""
-    try:
-        await message.reply_text(text, parse_mode="Markdown")
-    except BadRequest as exc:
-        error_text = str(exc).lower()
-        if "parse entities" not in error_text and "end of the entity" not in error_text:
-            raise
-        print(f"Telegram Markdown fallback: {type(exc).__name__}: {exc}", flush=True)
-        await message.reply_text(text)
+    """Делит длинный ответ и повторяет отправку без Markdown при ошибке разметки."""
+    for chunk in split_telegram_text(text):
+        try:
+            await message.reply_text(chunk, parse_mode="Markdown")
+        except BadRequest as exc:
+            error_text = str(exc).lower()
+            if "parse entities" not in error_text and "end of the entity" not in error_text:
+                raise
+            print(f"Telegram Markdown fallback: {type(exc).__name__}: {exc}", flush=True)
+            await message.reply_text(chunk)
 
 
 def friendly_ai_error(exc: Exception) -> tuple[str, str]:
@@ -1160,7 +1188,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
         await query.message.reply_text("Смотрю что происходит на небе...")
         reply = await ask_ai(uid, prompt)
-        await query.message.reply_text(reply, parse_mode="Markdown")
+        await send_ai_reply(query.message, reply)
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
         return CHAT
 
@@ -1204,7 +1232,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await query.message.reply_text("Смотрю в карту...")
         reply = await ask_ai(uid, full_prompt)
-        await query.message.reply_text(reply, parse_mode="Markdown")
+        await send_ai_reply(query.message, reply)
     except Exception as e:
         import traceback
         print(f"ERROR in handle_button: {traceback.format_exc()}")
@@ -1332,7 +1360,7 @@ HD {name2}: {hd2_str}
 Обращайся к {name1} на "ты". Конкретно, без воды, без терминов."""
 
                 reply = await ask_ai(uid, prompt)
-                await update.message.reply_text(reply, parse_mode="Markdown")
+                await send_ai_reply(update.message, reply)
                 await update.message.reply_text("Выбери следующую тему:", reply_markup=MENU_KEYBOARD)
                 users[uid]["menu_shown"] = True
             except Exception as e:
@@ -1341,7 +1369,7 @@ HD {name2}: {hd2_str}
             return CHAT
 
     reply = await ask_ai(uid, user_text)
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await send_ai_reply(update.message, reply)
 
     # Показываем меню только если это первый раз (menu_shown не установлен)
     if not users[uid].get("menu_shown"):
@@ -1440,7 +1468,7 @@ HD {name2}:
 Обращайся к {name1} на "ты". Говори конкретно, без воды. Никаких терминов без перевода на человеческий язык."""
 
         reply = await ask_ai(uid, prompt)
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        await send_ai_reply(update.message, reply)
         await update.message.reply_text("Что ещё исследуем у богов?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
         return CHAT
