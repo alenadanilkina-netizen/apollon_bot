@@ -30,6 +30,7 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, filters
 )
 from anthropic import Anthropic
+from openai import OpenAI
 from hd_library import get_hd_context, get_cross_context, get_love_context, get_phs_context, get_profile_context
 
 # Импортируем MCP-сервер напрямую (надёжнее чем subprocess)
@@ -43,6 +44,17 @@ TOOL_HANDLERS = _mcp_mod.TOOL_HANDLERS
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+COMPATIBLE_API_KEY = os.environ.get("COMPATIBLE_API_KEY", "")
+COMPATIBLE_BASE_URL = os.environ.get("COMPATIBLE_BASE_URL", "")
+COMPATIBLE_MODEL = os.environ.get("COMPATIBLE_MODEL", "")
+AI_PROVIDER_ORDER = [
+    item.strip().lower()
+    for item in os.environ.get("AI_PROVIDER_ORDER", "openai,anthropic,compatible").split(",")
+    if item.strip()
+]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 # Railway Volume: если есть /data — используем его (персистентный диск)
 # Иначе fallback к локальному файлу (разработка)
@@ -183,9 +195,28 @@ async def calculate_chart(birth: dict) -> tuple[dict, dict]:
     )
     return natal, hd
 
-# ─── CLAUDE AI ────────────────────────────────────────────────────────────────
+# ─── AI PROVIDERS ────────────────────────────────────────────────────────────────
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+anthropic_client = (
+    Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60, max_retries=1)
+    if ANTHROPIC_API_KEY
+    else None
+)
+openai_client = (
+    OpenAI(api_key=OPENAI_API_KEY, timeout=60, max_retries=1)
+    if OPENAI_API_KEY
+    else None
+)
+compatible_client = (
+    OpenAI(
+        api_key=COMPATIBLE_API_KEY,
+        base_url=COMPATIBLE_BASE_URL.rstrip("/"),
+        timeout=60,
+        max_retries=1,
+    )
+    if COMPATIBLE_API_KEY and COMPATIBLE_BASE_URL and COMPATIBLE_MODEL
+    else None
+)
 
 SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком астрологии — говоришь на человеческом.
 
@@ -273,7 +304,7 @@ d) Где противоречат — это НАПРЯЖЕНИЕ, самое �
 — Никаких тире-списков внутри текста — только абзацы
 """
 
-def _ask_claude_sync(user_id: int, message: str) -> str:
+def _ask_ai_sync(user_id: int, message: str) -> str:
     user = users.get(user_id, {})
     history = user.get("history", [])
 
@@ -313,22 +344,61 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
             f"{blocks_note}"
         )
 
-    history.append({"role": "user", "content": message + context if not history else message})
+    request_history = history + [
+        {"role": "user", "content": message + context if not history else message}
+    ]
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2500,
-        system=SYSTEM_PROMPT,
-        messages=history
-    )
-    reply = response.content[0].text
+    reply = ""
+    provider_errors = []
+    for provider in AI_PROVIDER_ORDER:
+        try:
+            if provider == "openai" and openai_client:
+                response = openai_client.responses.create(
+                    model=OPENAI_MODEL,
+                    instructions=SYSTEM_PROMPT,
+                    input=request_history,
+                    max_output_tokens=2500,
+                )
+                reply = response.output_text
+            elif provider == "anthropic" and anthropic_client:
+                response = anthropic_client.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=2500,
+                    system=SYSTEM_PROMPT,
+                    messages=request_history,
+                )
+                reply = response.content[0].text if response.content else ""
+            elif provider == "compatible" and compatible_client:
+                response = compatible_client.chat.completions.create(
+                    model=COMPATIBLE_MODEL,
+                    max_tokens=2500,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, *request_history],
+                )
+                reply = response.choices[0].message.content or ""
+            else:
+                continue
+
+            if reply.strip():
+                print(f"AI provider succeeded: {provider}")
+                break
+            raise RuntimeError("empty response")
+        except Exception as exc:
+            provider_errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            print(f"AI provider failed: {provider}: {type(exc).__name__}: {exc}")
+            reply = ""
+
+    if not reply:
+        details = " | ".join(provider_errors) if provider_errors else "no configured providers"
+        raise RuntimeError(f"All AI providers failed: {details}")
+
+    history = request_history
     history.append({"role": "assistant", "content": reply})
 
     users[user_id]["history"] = history[-20:]
     return reply
 
-async def ask_claude(user_id: int, message: str) -> str:
-    return await asyncio.to_thread(_ask_claude_sync, user_id, message)
+async def ask_ai(user_id: int, message: str) -> str:
+    return await asyncio.to_thread(_ask_ai_sync, user_id, message)
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
 
@@ -460,10 +530,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Прежде чем начать — важный момент.\n\n"
         "Для анализа мне нужны твои дата, время и место рождения. "
-        "Эти данные хранятся в защищённой базе и используются только для расчёта твоей карты. "
-        "Мы не передаём их третьим лицам.\n\n"
-        "Нажимая «Принимаю», ты соглашаешься с обработкой этих данных в соответствии "
-        "с нашей политикой конфиденциальности.\n\n"
+        "Они сохраняются в базе сервиса для восстановления карты. "
+        "Для формирования персонального разбора данные и результаты расчёта передаются "
+        "подключённому поставщику AI API.\n\n"
+        "Нажимая «Принимаю», ты соглашаешься с описанной обработкой этих данных.\n\n"
         "По вопросам: @danilkina",
         reply_markup=consent_kb
     )
@@ -573,7 +643,7 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "а точным описанием что этот человек делает иначе и где это его подводит. "
             "Используй карту — конкретные боги с конкретными характерами, не абстракции."
         )
-        reply = await ask_claude(uid, prompt)
+        reply = await ask_ai(uid, prompt)
         await update.message.reply_text(reply, parse_mode="Markdown")
         await update.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
@@ -1015,7 +1085,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name = users[uid].get("name", "")
         prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
         await query.message.reply_text("Смотрю что происходит на небе...")
-        reply = await ask_claude(uid, prompt)
+        reply = await ask_ai(uid, prompt)
         await query.message.reply_text(reply, parse_mode="Markdown")
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
         return CHAT
@@ -1059,7 +1129,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.message.reply_text("Смотрю в карту...")
-        reply = await ask_claude(uid, full_prompt)
+        reply = await ask_ai(uid, full_prompt)
         await query.message.reply_text(reply, parse_mode="Markdown")
     except Exception as e:
         import traceback
@@ -1187,7 +1257,7 @@ HD {name2}: {hd2_str}
 
 Обращайся к {name1} на "ты". Конкретно, без воды, без терминов."""
 
-                reply = await ask_claude(uid, prompt)
+                reply = await ask_ai(uid, prompt)
                 await update.message.reply_text(reply, parse_mode="Markdown")
                 await update.message.reply_text("Выбери следующую тему:", reply_markup=MENU_KEYBOARD)
                 users[uid]["menu_shown"] = True
@@ -1196,7 +1266,7 @@ HD {name2}: {hd2_str}
                 await update.message.reply_text("Упс... Посейдон разлил воду. Попробуй ещё раз.")
             return CHAT
 
-    reply = await ask_claude(uid, user_text)
+    reply = await ask_ai(uid, user_text)
     await update.message.reply_text(reply, parse_mode="Markdown")
 
     # Показываем меню только если это первый раз (menu_shown не установлен)
@@ -1295,7 +1365,7 @@ HD {name2}:
 
 Обращайся к {name1} на "ты". Говори конкретно, без воды. Никаких терминов без перевода на человеческий язык."""
 
-        reply = await ask_claude(uid, prompt)
+        reply = await ask_ai(uid, prompt)
         await update.message.reply_text(reply, parse_mode="Markdown")
         await update.message.reply_text("Что ещё исследуем у богов?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
@@ -1318,9 +1388,8 @@ def main():
         print("❌ Нужен TELEGRAM_TOKEN в переменных окружения")
         print("   export TELEGRAM_TOKEN='ваш_токен'")
         return
-    if not ANTHROPIC_API_KEY:
-        print("❌ Нужен ANTHROPIC_API_KEY в переменных окружения")
-        print("   export ANTHROPIC_API_KEY='ваш_ключ'")
+    if not any((OPENAI_API_KEY, ANTHROPIC_API_KEY, compatible_client)):
+        print("❌ Нужен хотя бы один AI API ключ: OPENAI_API_KEY, ANTHROPIC_API_KEY или COMPATIBLE_API_KEY")
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1354,6 +1423,7 @@ def main():
             hc.BOT_TOKEN     = TELEGRAM_TOKEN
             hc.ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")
             hc.ANTHROPIC_KEY = ANTHROPIC_API_KEY
+            hc.OPENAI_KEY    = OPENAI_API_KEY
             if not hc.ALERT_CHAT_ID:
                 return  # некуда слать — молчим
             results = []
