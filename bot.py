@@ -25,6 +25,7 @@ if env_file.exists():
             os.environ[k.strip()] = v.strip()
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
@@ -379,12 +380,12 @@ def _ask_ai_sync(user_id: int, message: str) -> str:
                 continue
 
             if reply.strip():
-                print(f"AI provider succeeded: {provider}")
+                print(f"AI provider succeeded: {provider}", flush=True)
                 break
             raise RuntimeError("empty response")
         except Exception as exc:
             provider_errors.append(f"{provider}: {type(exc).__name__}: {exc}")
-            print(f"AI provider failed: {provider}: {type(exc).__name__}: {exc}")
+            print(f"AI provider failed: {provider}: {type(exc).__name__}: {exc}", flush=True)
             reply = ""
 
     if not reply:
@@ -399,6 +400,66 @@ def _ask_ai_sync(user_id: int, message: str) -> str:
 
 async def ask_ai(user_id: int, message: str) -> str:
     return await asyncio.to_thread(_ask_ai_sync, user_id, message)
+
+
+async def send_ai_reply(message, text: str):
+    """Повторяет отправку без Markdown, если Telegram не разобрал разметку AI."""
+    try:
+        await message.reply_text(text, parse_mode="Markdown")
+    except BadRequest as exc:
+        error_text = str(exc).lower()
+        if "parse entities" not in error_text and "end of the entity" not in error_text:
+            raise
+        print(f"Telegram Markdown fallback: {type(exc).__name__}: {exc}", flush=True)
+        await message.reply_text(text)
+
+
+def friendly_ai_error(exc: Exception) -> tuple[str, str]:
+    """Преобразует ошибку API в безопасное сообщение без секретов."""
+    error_text = str(exc).lower()
+    if any(marker in error_text for marker in (
+        "insufficient_quota", "credit balance", "current quota",
+        "billing_hard_limit_reached", "billing",
+    )):
+        return "AI_BALANCE", (
+            "На балансе AI API недостаточно средств или оплата ещё не активировалась. "
+            "Проверь Billing и попробуй снова через несколько минут."
+        )
+    if any(marker in error_text for marker in (
+        "invalid_api_key", "authentication", "incorrect api key",
+        "unauthorized", "error code: 401",
+    )):
+        return "AI_KEY", (
+            "AI-сервис отклонил ключ. Проверь, что в Railway вставлен полный ключ без скобок и пробелов."
+        )
+    if "model" in error_text and any(marker in error_text for marker in (
+        "not found", "does not exist", "access", "unsupported", "error code: 404",
+    )):
+        return "AI_MODEL", (
+            "У API-аккаунта нет доступа к выбранной модели. Проверь название модели в Railway."
+        )
+    if any(marker in error_text for marker in ("rate limit", "too many requests", "error code: 429")):
+        return "AI_LIMIT", (
+            "AI-сервис временно ограничил количество запросов. Подожди минуту и попробуй снова."
+        )
+    return "AI_UNAVAILABLE", (
+        "AI-сервис сейчас не смог сформировать разбор. Настройки карты сохранены — попробуй снова чуть позже."
+    )
+
+
+async def alert_runtime_error(ctx: ContextTypes.DEFAULT_TYPE, stage: str, exc: Exception):
+    """Немедленно сообщает владельцу причину, если задан ALERT_CHAT_ID."""
+    alert_chat_id = os.environ.get("ALERT_CHAT_ID", "").strip()
+    if not alert_chat_id:
+        return
+    detail = str(exc).replace("`", "'")[:1800]
+    try:
+        await ctx.bot.send_message(
+            chat_id=alert_chat_id,
+            text=f"⚠️ Аполлон: ошибка на этапе {stage}\n{type(exc).__name__}: {detail}",
+        )
+    except Exception as alert_exc:
+        print(f"Could not send runtime alert: {type(alert_exc).__name__}: {alert_exc}", flush=True)
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
 
@@ -615,6 +676,7 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Смотрю в карту. Боги собираются...")
 
+    stage = "CALCULATION"
     try:
         natal, hd = await calculate_chart(users[uid]["birth"])
         users[uid]["chart"] = natal
@@ -630,7 +692,7 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 break
         db_save_user(uid, username, users[uid]["name"], users[uid]["birth"], hd_type)
 
-        # Просим Claude построить первый разбор
+        # Просим AI построить первый разбор
         b = users[uid]["birth"]
         name = users[uid]['name']
         prompt = (
@@ -643,8 +705,10 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "а точным описанием что этот человек делает иначе и где это его подводит. "
             "Используй карту — конкретные боги с конкретными характерами, не абстракции."
         )
+        stage = "AI"
         reply = await ask_ai(uid, prompt)
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        stage = "TELEGRAM"
+        await send_ai_reply(update.message, reply)
         await update.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
         return CHAT
@@ -652,11 +716,21 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         import traceback
         err = traceback.format_exc()
-        print(f"ERROR in ask_place: {err}")
-        await update.message.reply_text(
-            "Упс... Посейдон разлил воду и всё немного сломалось. "
-            "Боги уже чинят. Попробуй написать /start чтобы начать заново."
-        )
+        print(f"ERROR in ask_place [{stage}]: {err}", flush=True)
+        await alert_runtime_error(ctx, stage, e)
+        if stage == "AI":
+            error_code, error_message = friendly_ai_error(e)
+            await update.message.reply_text(f"{error_message}\n\nКод ошибки: {error_code}")
+        elif stage == "TELEGRAM":
+            await update.message.reply_text(
+                "Разбор готов, но Telegram не смог его доставить. Попробуй ещё раз через минуту.\n\n"
+                "Код ошибки: TELEGRAM_SEND"
+            )
+        else:
+            await update.message.reply_text(
+                "Не удалось завершить расчёт карты. Попробуй начать заново через /start.\n\n"
+                "Код ошибки: CALCULATION"
+            )
         return ConversationHandler.END
 
 
