@@ -27,11 +27,13 @@ if env_file.exists():
             os.environ[k.strip()] = v.strip()
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
 )
 from anthropic import Anthropic
+from openai import OpenAI
 from hd_library import get_hd_context, get_cross_context, get_love_context, get_phs_context, get_profile_context
 
 # Импортируем MCP-сервер напрямую (надёжнее чем subprocess)
@@ -45,6 +47,17 @@ TOOL_HANDLERS = _mcp_mod.TOOL_HANDLERS
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+COMPATIBLE_API_KEY = os.environ.get("COMPATIBLE_API_KEY", "")
+COMPATIBLE_BASE_URL = os.environ.get("COMPATIBLE_BASE_URL", "")
+COMPATIBLE_MODEL = os.environ.get("COMPATIBLE_MODEL", "")
+AI_PROVIDER_ORDER = [
+    item.strip().lower()
+    for item in os.environ.get("AI_PROVIDER_ORDER", "anthropic,openai,compatible").split(",")
+    if item.strip()
+]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
 # До подключения оплаты оставляем мягкий режим: пользователь видит срок
@@ -383,9 +396,26 @@ async def generate_compatibility_reply(uid: int, compat: dict) -> str:
     )
     return await ask_claude(uid, prompt)
 
-# ─── CLAUDE AI ────────────────────────────────────────────────────────────────
+# ─── AI PROVIDERS ─────────────────────────────────────────────────────────────
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+anthropic_client = (
+    Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60, max_retries=1)
+    if ANTHROPIC_API_KEY else None
+)
+openai_client = (
+    OpenAI(api_key=OPENAI_API_KEY, timeout=60, max_retries=1)
+    if OPENAI_API_KEY else None
+)
+compatible_client = (
+    OpenAI(
+        api_key=COMPATIBLE_API_KEY,
+        base_url=COMPATIBLE_BASE_URL.rstrip("/"),
+        timeout=60,
+        max_retries=1,
+    )
+    if COMPATIBLE_API_KEY and COMPATIBLE_BASE_URL and COMPATIBLE_MODEL
+    else None
+)
 
 SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком астрологии — говоришь на человеческом.
 
@@ -530,20 +560,56 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
             f"{blocks_note}"
         )
 
-    # Контекст карты не должен исчезать после первого сообщения, но и не должен
-    # копироваться в двадцать предыдущих реплик. В API отправляем актуальные
-    # факты вместе с текущим вопросом, а в постоянной истории храним короткий
-    # вопрос без дубликата карты.
-    api_history = history[-12:] + [{"role": "user", "content": message + context}]
+    # Контекст карты добавляем к текущему запросу, а не дублируем его во всей
+    # истории. При этом сохраняем fallback между настроенными провайдерами.
+    request_history = history[-12:] + [
+        {"role": "user", "content": message + context if not history else message}
+    ]
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2500,
-        system=SYSTEM_PROMPT,
-        messages=api_history
-    )
-    reply = response.content[0].text
-    history.append({"role": "user", "content": message})
+    reply = ""
+    provider_errors = []
+    for provider in AI_PROVIDER_ORDER:
+        try:
+            if provider == "openai" and openai_client:
+                response = openai_client.responses.create(
+                    model=OPENAI_MODEL,
+                    instructions=SYSTEM_PROMPT,
+                    input=request_history,
+                    max_output_tokens=2500,
+                )
+                reply = response.output_text
+            elif provider == "anthropic" and anthropic_client:
+                response = anthropic_client.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=2500,
+                    system=SYSTEM_PROMPT,
+                    messages=request_history,
+                )
+                reply = response.content[0].text if response.content else ""
+            elif provider == "compatible" and compatible_client:
+                response = compatible_client.chat.completions.create(
+                    model=COMPATIBLE_MODEL,
+                    max_tokens=2500,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, *request_history],
+                )
+                reply = response.choices[0].message.content or ""
+            else:
+                continue
+
+            if reply.strip():
+                print(f"AI provider succeeded: {provider}", flush=True)
+                break
+            raise RuntimeError("empty response")
+        except Exception as exc:
+            provider_errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            print(f"AI provider failed: {provider}: {type(exc).__name__}: {exc}", flush=True)
+            reply = ""
+
+    if not reply:
+        details = " | ".join(provider_errors) if provider_errors else "no configured providers"
+        raise RuntimeError(f"All AI providers failed: {details}")
+
+    history = request_history
     history.append({"role": "assistant", "content": reply})
 
     users[user_id]["history"] = history[-12:]
@@ -551,6 +617,10 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
 
 async def ask_claude(user_id: int, message: str) -> str:
     return await asyncio.to_thread(_ask_claude_sync, user_id, message)
+
+
+# Единое имя для новых обработчиков; старые сценарии сохраняют совместимость.
+ask_ai = ask_claude
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
 

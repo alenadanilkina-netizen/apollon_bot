@@ -7,6 +7,7 @@ Health-check агент для бота Аполлон.
   BOT_TOKEN          — токен бота (для отправки алертов)
   ALERT_CHAT_ID      — chat_id куда слать алерты (твой личный или специальный чат)
   ANTHROPIC_API_KEY  — ключ Claude
+  OPENAI_API_KEY     — ключ OpenAI
   MCP_SERVER_URL     — если MCP запущен отдельно (опционально)
 """
 
@@ -24,6 +25,11 @@ import httpx
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "")
 ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")  # твой Telegram ID
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+COMPATIBLE_KEY = os.environ.get("COMPATIBLE_API_KEY", "")
+COMPATIBLE_BASE_URL = os.environ.get("COMPATIBLE_BASE_URL", "")
+COMPATIBLE_MODEL = os.environ.get("COMPATIBLE_MODEL", "")
 
 # ─── Отправка алерта ──────────────────────────────────────────────────────────
 
@@ -57,6 +63,7 @@ async def check_imports() -> tuple[bool, str]:
     """Проверяет что все модули импортируются без ошибок."""
     try:
         import anthropic
+        import openai
         # Пакет называется pyswisseph, но импортируется модулем swisseph.
         import swisseph
         from hd_library import (
@@ -191,33 +198,68 @@ async def check_hd_compatibility() -> tuple[bool, str]:
         return False, f"Составная HD-карта: {traceback.format_exc()[-300:]}"
 
 
-async def check_claude_api() -> tuple[bool, str]:
-    """Проверяет что Claude API отвечает."""
-    if not ANTHROPIC_KEY:
-        return False, "ANTHROPIC_API_KEY не задан"
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+async def check_ai_api() -> tuple[bool, str]:
+    """Проверяет первого доступного AI-провайдера с автоматическим fallback."""
+    errors = []
 
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.messages.create,
-                model="claude-sonnet-4-6",
-                max_tokens=50,
-                messages=[{"role": "user", "content": "Ответь одним словом: работаю"}]
-            ),
-            timeout=20
-        )
-        text = response.content[0].text if response.content else ""
-        if not text:
-            return False, "Claude API: пустой ответ"
+    if OPENAI_KEY:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_KEY)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.responses.create,
+                    model=OPENAI_MODEL,
+                    input="Ответь одним словом: работаю",
+                    max_output_tokens=30,
+                ),
+                timeout=20,
+            )
+            if response.output_text:
+                return True, f"OpenAI API OK ({OPENAI_MODEL})"
+            errors.append("OpenAI: пустой ответ")
+        except Exception as e:
+            errors.append(f"OpenAI: {e}")
 
-        return True, f"Claude API OK (ответил: '{text[:30]}')"
+    if ANTHROPIC_KEY:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.messages.create,
+                    model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                    max_tokens=50,
+                    messages=[{"role": "user", "content": "Ответь одним словом: работаю"}],
+                ),
+                timeout=20,
+            )
+            if response.content:
+                return True, "Anthropic API OK"
+            errors.append("Anthropic: пустой ответ")
+        except Exception as e:
+            errors.append(f"Anthropic: {e}")
 
-    except asyncio.TimeoutError:
-        return False, "Claude API: timeout 20s"
-    except Exception as e:
-        return False, f"Claude API: {e}"
+    if COMPATIBLE_KEY and COMPATIBLE_BASE_URL and COMPATIBLE_MODEL:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=COMPATIBLE_KEY, base_url=COMPATIBLE_BASE_URL.rstrip("/"))
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=COMPATIBLE_MODEL,
+                    max_tokens=30,
+                    messages=[{"role": "user", "content": "Ответь одним словом: работаю"}],
+                ),
+                timeout=20,
+            )
+            if response.choices and response.choices[0].message.content:
+                return True, f"Compatible AI API OK ({COMPATIBLE_MODEL})"
+            errors.append("Compatible API: пустой ответ")
+        except Exception as e:
+            errors.append(f"Compatible API: {e}")
+
+    return False, " | ".join(errors) if errors else "AI API ключи не заданы"
 
 
 async def check_bot_prompts() -> tuple[bool, str]:
@@ -287,7 +329,7 @@ CHECKS = [
     ("MCP сервер",     check_mcp_server),
     ("HD карта",       check_human_design),
     ("HD совместимость", check_hd_compatibility),
-    ("Claude API",     check_claude_api),
+    ("AI API",          check_ai_api),
 ]
 
 
