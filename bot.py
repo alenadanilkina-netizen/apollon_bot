@@ -4,17 +4,19 @@
 Анализ карты через пантеон греческих богов + HD
 """
 
+from __future__ import annotations
+
 import os
 import json
 import asyncio
 import subprocess
 import sys
 import sqlite3
-import hashlib
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # Загружаем .env если есть
 env_file = Path(__file__).parent / ".env"
@@ -57,6 +59,15 @@ AI_PROVIDER_ORDER = [
     if item.strip()
 ]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
+# До подключения оплаты оставляем мягкий режим: пользователь видит срок
+# пробного доступа, но не блокируется внезапно. Для запуска paywall на Railway
+# достаточно выставить TRIAL_ENFORCED=1.
+TRIAL_ENFORCED = os.environ.get("TRIAL_ENFORCED", "0").lower() in {"1", "true", "yes", "on"}
+PREMIUM_USER_IDS = {
+    int(value.strip()) for value in os.environ.get("PREMIUM_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 # Railway Volume: если есть /data — используем его (персистентный диск)
 # Иначе fallback к локальному файлу (разработка)
 _DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -80,51 +91,86 @@ def db_init():
             birth_hour  INTEGER,
             birth_minute INTEGER,
             city        TEXT,
+            lat         REAL,
+            lon         REAL,
+            utc_offset  REAL,
             hd_type     TEXT,
             blocks_seen TEXT DEFAULT '[]',
+            trial_started TEXT,
+            brand_data   TEXT DEFAULT '{}',
             first_seen  TEXT,
             last_seen   TEXT
         )
     """)
+    # Миграция для уже существующей базы Railway Volume.
+    existing = {row[1] for row in con.execute("PRAGMA table_info(users)").fetchall()}
+    for column, sql_type in (("lat", "REAL"), ("lon", "REAL"), ("utc_offset", "REAL"),
+                             ("trial_started", "TEXT"), ("brand_data", "TEXT")):
+        if column not in existing:
+            con.execute(f"ALTER TABLE users ADD COLUMN {column} {sql_type}")
     con.commit()
     con.close()
 
-def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str = ""):
+def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str = "",
+                 trial_started: datetime | None = None):
     con = sqlite3.connect(DB_PATH)
     now = datetime.now().isoformat()
+    trial_started_iso = (trial_started or datetime.now()).isoformat()
     con.execute("""
         INSERT INTO users (tg_id, username, name, birth_day, birth_month, birth_year,
-            birth_hour, birth_minute, city, hd_type, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            birth_hour, birth_minute, city, lat, lon, utc_offset, hd_type,
+            trial_started, brand_data, first_seen, last_seen)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(tg_id) DO UPDATE SET
             username=excluded.username, name=excluded.name,
             birth_day=excluded.birth_day, birth_month=excluded.birth_month,
             birth_year=excluded.birth_year, birth_hour=excluded.birth_hour,
             birth_minute=excluded.birth_minute, city=excluded.city,
-            hd_type=excluded.hd_type, last_seen=excluded.last_seen
+            lat=excluded.lat, lon=excluded.lon, utc_offset=excluded.utc_offset,
+            hd_type=excluded.hd_type,
+            trial_started=COALESCE(users.trial_started, excluded.trial_started),
+            brand_data=COALESCE(users.brand_data, excluded.brand_data),
+            last_seen=excluded.last_seen
     """, (tg_id, username, name,
           birth.get("day"), birth.get("month"), birth.get("year"),
           birth.get("hour"), birth.get("minute"), birth.get("city",""),
-          hd_type, now, now))
+          birth.get("lat"), birth.get("lon"), birth.get("utc_offset"),
+          hd_type, trial_started_iso, "{}", now, now))
     con.commit()
     con.close()
 
 def db_load_user(tg_id: int) -> dict | None:
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
-        "SELECT name, birth_day, birth_month, birth_year, birth_hour, birth_minute, city, blocks_seen FROM users WHERE tg_id=?",
+        "SELECT name, birth_day, birth_month, birth_year, birth_hour, birth_minute, city, lat, lon, utc_offset, blocks_seen, trial_started, brand_data FROM users WHERE tg_id=?",
         (tg_id,)
     ).fetchone()
-    con.close()
     if not row or not row[1]:
+        con.close()
         return None
-    name, d, m, y, h, mi, city, blocks_json = row
+    name, d, m, y, h, mi, city, lat, lon, utc_offset, blocks_json, trial_started, brand_json = row
+    if not trial_started:
+        trial_started = datetime.now().isoformat()
+        con.execute("UPDATE users SET trial_started=? WHERE tg_id=?", (trial_started, tg_id))
+        con.commit()
+    con.close()
     blocks_seen = json.loads(blocks_json or "[]")
+    try:
+        trial_start = datetime.fromisoformat(trial_started) if trial_started else datetime.now()
+    except Exception:
+        trial_start = datetime.now()
+    try:
+        brand_data = json.loads(brand_json or "{}")
+    except Exception:
+        brand_data = {}
     return {
         "name": name,
-        "birth": {"day": d, "month": m, "year": y, "hour": h, "minute": mi or 0, "city": city or ""},
+        "birth": {"day": d, "month": m, "year": y, "hour": h, "minute": mi or 0,
+                  "city": city or "", "lat": lat, "lon": lon, "utc_offset": utc_offset},
         "blocks_seen": blocks_seen,
         "menu_shown": len(blocks_seen) > 0,  # если уже были блоки — меню уже показывали
+        "trial_start": trial_start,
+        "brand_data": brand_data,
     }
 
 def db_add_block(tg_id: int, block: str):
@@ -139,6 +185,56 @@ def db_add_block(tg_id: int, block: str):
         con.commit()
     con.close()
 
+
+def db_save_brand(tg_id: int, brand_data: dict):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "UPDATE users SET brand_data=?, last_seen=? WHERE tg_id=?",
+        (json.dumps(brand_data, ensure_ascii=False), datetime.now().isoformat(), tg_id),
+    )
+    con.commit()
+    con.close()
+
+
+def trial_status(uid: int) -> tuple[datetime, int, bool]:
+    """Возвращает начало пробного периода, оставшиеся часы и факт окончания."""
+    started = users.get(uid, {}).get("trial_start")
+    if not isinstance(started, datetime):
+        started = datetime.now()
+        if uid in users:
+            users[uid]["trial_start"] = started
+    expires = started + timedelta(days=TRIAL_DAYS)
+    remaining_seconds = max(0, int((expires - datetime.now()).total_seconds()))
+    remaining_hours = (remaining_seconds + 3599) // 3600
+    return started, remaining_hours, remaining_seconds <= 0
+
+
+def trial_banner(uid: int) -> str:
+    """Коротко сообщает срок доступа, не превращая каждый ответ в рекламу."""
+    _, hours_left, expired = trial_status(uid)
+    if expired:
+        return "Пробный доступ на 3 дня завершён."
+    days = hours_left // 24
+    hours = hours_left % 24
+    if days:
+        left = f"{days} дн. {hours} ч." if hours else f"{days} дн."
+    else:
+        left = f"{hours} ч."
+    return f"Бесплатный доступ: осталось {left}."
+
+
+def trial_blocked_message(uid: int) -> str:
+    return (
+        "Твой бесплатный доступ на 3 дня завершён.\n\n"
+        "Я сохранил твою карту. Если хочешь продолжить разборы и прогнозы, "
+        "напиши Алёне: @danilkina."
+    )
+
+
+def has_premium_access(uid: int) -> bool:
+    """Временный серверный шлюз до подключения реальной оплаты."""
+    return uid in PREMIUM_USER_IDS
+
 db_init()
 
 # ─── СОСТОЯНИЯ ДИАЛОГА ───────────────────────────────────────────────────────
@@ -150,6 +246,39 @@ COMPAT_NAME, COMPAT_DATE, COMPAT_TIME, COMPAT_PLACE = range(11)
 # В продакшне заменить на базу данных
 
 users = {}  # user_id → {name, birth_data, chart, hd, history, trial_days}
+
+# Telegram ограничивает текст одного сообщения 4096 символами. Кроме того,
+# Claude иногда возвращает Markdown, который не проходит строгий парсер Telegram
+# (например, из-за незакрытой звёздочки). Один безопасный шлюз не даёт длинному
+# или чуть некорректно размеченному ответу ломать весь сценарий кнопки.
+async def safe_send(message_obj, text: str, *, reply_markup=None, parse_mode="Markdown"):
+    text = str(text or "").strip()
+    if not text:
+        return
+
+    # Режем по абзацам, а не посередине слова. 3900 оставляет запас под служебные
+    # символы Telegram и делает повторную отправку предсказуемой.
+    chunks = []
+    while len(text) > 3900:
+        cut = text.rfind("\n\n", 0, 3900)
+        if cut < 1200:
+            cut = text.rfind("\n", 0, 3900)
+        if cut < 1200:
+            cut = text.rfind(" ", 0, 3900)
+        if cut < 1:
+            cut = 3900
+        chunks.append(text[:cut].strip())
+        text = text[cut:].lstrip()
+    chunks.append(text)
+
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
+        try:
+            await message_obj.reply_text(chunk, parse_mode=parse_mode, reply_markup=markup)
+        except Exception as exc:
+            # Некорректный Markdown не должен превращаться в TELEGRAM_SEND.
+            print(f"WARN safe_send: Markdown rejected ({exc}); retrying plain text")
+            await message_obj.reply_text(chunk, reply_markup=markup)
 
 # ─── МЕТОДОЛОГИЯ ─────────────────────────────────────────────────────────────
 
@@ -196,17 +325,86 @@ async def calculate_chart(birth: dict) -> tuple[dict, dict]:
     )
     return natal, hd
 
-# ─── AI PROVIDERS ────────────────────────────────────────────────────────────────
+
+def build_compatibility_prompt(name1: str, name2: str, rel_type: str,
+                               time_note: str, chart1: str, hd1: str,
+                               chart2: str, hd2: str) -> str:
+    """Собирает промпт после отдельного расчёта обеих карт.
+
+    Составная карта рассчитана кодом в server.py. Модель получает готовые
+    категории connection chart и переводит их в человеческий язык.
+    """
+    hd_connection = _mcp_mod.build_hd_compatibility(hd1, hd2, name1, name2)
+    hd_context1 = get_hd_context({"raw": hd1})
+    hd_context2 = get_hd_context({"raw": hd2})
+    return f"""Сделай точный разбор совместимости для типа отношений: {rel_type}.
+
+Люди: {name1} и {name2}{time_note}.
+
+Сначала используй только расчётные факты ниже. Не пересчитывай составную карту
+«по впечатлению» и не добавляй каналы, которых нет в блоке. Затем переведи их в
+наблюдаемое поведение: как люди принимают решения, распределяют инициативу,
+переносят напряжение и что у них получается вместе. Технические слова в ответе
+не используй; если без них нельзя, сразу переводи их на человеческий язык.
+
+=== РАСЧЁТ СОСТАВНОЙ КАРТЫ ===
+{hd_connection}
+
+=== АСТРОЛОГИЯ {name1} ===
+{chart1}
+
+=== АСТРОЛОГИЯ {name2} ===
+{chart2}
+
+=== ИНДИВИДУАЛЬНЫЙ HD {name1} ===
+{hd1}
+{hd_context1}
+
+=== ИНДИВИДУАЛЬНЫЙ HD {name2} ===
+{hd2}
+{hd_context2}
+
+Структура ответа:
+1. Короткая шуточная сцена на Олимпе — только рамка, не вместо анализа.
+2. Главная динамика пары — что их тянет друг к другу и где возникает трение.
+3. Что буквально рассчитано в составной карте: общие каналы, электромагнитные
+связи, компромиссы и доминирование. Объясни найденные связи, но не выдумывай
+смысл для категории, где написано «нет».
+4. Как это проявляется в выбранном типе отношений: {rel_type}.
+5. Главный риск и практический способ с ним обращаться.
+6. Главный общий ресурс.
+
+Отделяй расчёт от интерпретации. Не обещай судьбу, не называй отношения
+«идеальными» или «обречёнными», не повторяй одну и ту же мысль в разных разделах.
+Обращайся к {name1} на «ты»."""
+
+
+async def generate_compatibility_reply(uid: int, compat: dict) -> str:
+    """Посчитать вторую карту, составную HD-карту и получить итоговый текст."""
+    natal2, hd2 = await calculate_chart(compat["birth"])
+    name1 = users[uid].get("name", "")
+    name2 = compat["name"]
+    chart1 = users[uid].get("chart", {}).get("raw", "")
+    hd1 = users[uid].get("hd", {}).get("raw", "")
+    chart2 = natal2.get("raw", "")
+    hd2_raw = hd2.get("raw", "")
+    no_time = compat.get("no_time", False)
+    time_note = " (время рождения неизвестно — линии и дома приблизительны)" if no_time else ""
+    prompt = build_compatibility_prompt(
+        name1, name2, compat.get("type", "отношения"), time_note,
+        chart1, hd1, chart2, hd2_raw,
+    )
+    return await ask_claude(uid, prompt)
+
+# ─── AI PROVIDERS ─────────────────────────────────────────────────────────────
 
 anthropic_client = (
     Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60, max_retries=1)
-    if ANTHROPIC_API_KEY
-    else None
+    if ANTHROPIC_API_KEY else None
 )
 openai_client = (
     OpenAI(api_key=OPENAI_API_KEY, timeout=60, max_retries=1)
-    if OPENAI_API_KEY
-    else None
+    if OPENAI_API_KEY else None
 )
 compatible_client = (
     OpenAI(
@@ -235,8 +433,16 @@ SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком 
 — "Артемида поспорила с Аресом кто важнее в этой карте. Спор в самом разгаре, ставки высоки, Гермес принимает ставки. Пока они выясняют — вот что я вижу."
 Называй ТОЛЬКО богов из карты этого человека (по его планетам). Знаки можно назвать здесь и только здесь.
 
-СВОДКА — кто ты (обязательно после шутки, для каждого блока):
-Объясняй тип, авторитет и профиль так, будто человек впервые слышит про себя. Никаких терминов без расшифровки.
+СВОДКА — кто ты (только во вступительном разборе):
+Во вступительном разборе объясни механику действий, решений и взаимодействия так, будто человек впервые слышит о себе. В последующих кнопках не повторяй эту сводку — применяй её молча к теме блока.
+
+ПЕРВЫЙ РАЗБОР:
+После короткой сцены собери цельный портрет из двух систем. Покажи, как человек
+входит в действие, как принимает решения, что у него получается естественно,
+где он чаще всего сбивается и что помогает вернуться к себе. Используй полную
+карту, но не превращай ответ в перечень положений. Дай 5–7 коротких абзацев,
+одну конкретную суперсилу и одну конкретную ловушку. В конце задай один вопрос,
+который приглашает проверить наблюдение в реальной жизни.
 
 КАК ОБЪЯСНЯТЬ ТИП (выбери нужное по карте):
 • Проектор — "Ты из тех людей, у кого нет постоянной батарейки как у большинства. Зато есть рентген на людей и ситуации — ты видишь то, что другие не замечают. Твоя суперсила работает только по приглашению: когда тебя зовут, спрашивают, хотят услышать — ты на своём месте и выдаёшь невероятное. Когда не зовут и ты всё равно лезешь — тебя не слышат, и это не твоя вина, это механика."
@@ -253,7 +459,7 @@ SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком 
 • Ментальный (только у Проекторов) — "Как ты принимаешь решения правильно: через разговор с доверенным человеком. Не за советом — просто слушай себя пока говоришь. Твоя ясность рождается в звуке твоего собственного голоса."
 
 КАК ОБЪЯСНЯТЬ ПРОФИЛЬ — называй профиль и сразу расшифровывай через жизнь:
-Используй данные из HD БИБЛИОТЕКА (секция ПРОФИЛЬ) — там уже есть описание обеих линий. Переведи на человеческий язык: что это значит в поведении, в отношениях, в работе. Называй профиль (1/3, 2/4 и т.д.) — но сразу объясняй что это.
+Используй данные из HD БИБЛИОТЕКА (секция ПРОФИЛЬ) — там уже есть описание обеих линий. Переведи на человеческий язык: что это значит в поведении, отношениях и работе. Не называй номер профиля и линии в ответе.
 
 ═══════════════════════════════════════
 ПРАВИЛА ТЕКСТА
@@ -261,7 +467,7 @@ SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком 
 
 1. Всегда на "ты". Никогда "этот человек", "она/он" в третьем лице.
 2. Согласуй род с именем. Женское имя — женский род везде.
-3. Термины HD можно называть — но сразу расшифровывать. "Ты Проектор — это значит..." "Эмоциональный авторитет — это значит..." Человек должен понять что это про него, без гугла.
+3. В пользовательском тексте не называй технические термины HD, номера профиля, центров, каналов и ворот. Переводи их в наблюдаемое поведение: кто делает первый шаг, как тело принимает решения, где человек устойчив и где впитывает чужое давление.
 4. Знаки зодиака — ТОЛЬКО в первой шутке-сводке. Дальше — никогда.
 5. Имена богов — только в шутке в начале и в конце. В основном тексте: "твоё Солнце", "твой Марс", "твоя Венера". Не "Афродита у тебя...", "Арес решил..." в середине анализа.
 6. Аспекты — описывай через отношения и жизнь, не называй тип. Не "квадратура Марса и Сатурна" — а "твоя энергия действия и твои правила постоянно спорят между собой".
@@ -273,12 +479,11 @@ SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком 
 ═══════════════════════════════════════
 ТРАНЗИТЫ — КАК ПИСАТЬ
 ═══════════════════════════════════════
-Транзиты пиши точно, конкретно, с датами и пользой:
-— Называй планету и что она делает прямо сейчас или в ближайшее время
-— Давай конкретные даты или диапазоны ("до 15 июля", "с конца августа", "весь октябрь")
-— Переводи в жизнь: не "Юпитер трансит твоё Солнце" — а "с [дата] по [дата] у тебя период расширения в теме [дом] — это значит конкретно вот что..."
-— Называй что делать и чего избегать в этот период
-— Никакой воды: "возможно что-то изменится" — не годится. "До 20 июля давление в отношениях — это Марс. После — спадёт" — годится.
+Транзиты пиши только по нескольким переданным срезам:
+— Называй планету и наблюдаемую тему, если она повторяется в соседних датах
+— Не превращай один срез в прогноз на месяц или год и не обещай событие
+— Точные даты пиков и переходов называй только если они отдельно рассчитаны
+— Переводи движение неба в ситуации, решения и разговоры, а не в перечень терминов
 
 ═══════════════════════════════════════
 СИНТЕЗ — ГЛАВНЫЙ ПРИНЦИП
@@ -286,9 +491,9 @@ SYSTEM_PROMPT = f"""Ты — Аполлон. Говоришь не языком 
 Всегда работай с ПОЛНОЙ картой — и астрологией, и HD.
 a) Что говорит астрология по теме
 b) Что говорит HD по той же теме
-c) Где обе системы говорят одно — это ФАКТ, говори уверенно
+c) Где обе системы говорят одно — это сходная тема, говори ясно, но не выдавай её за доказанный факт
 d) Где противоречат — это НАПРЯЖЕНИЕ, самое интересное
-Когда паттерн повторяется в обеих системах — это точно про человека.
+Когда одна тема повторяется в обеих системах — отмечай это как сходную интерпретацию, а не как доказанный факт.
 
 ═══════════════════════════════════════
 КОНЕЦ КАЖДОГО ОТВЕТА
@@ -303,9 +508,17 @@ d) Где противоречат — это НАПРЯЖЕНИЕ, самое �
 — Пустая строка между смысловыми блоками
 — Живой монолог, не статья, не список
 — Никаких тире-списков внутри текста — только абзацы
+
+ДИСЦИПЛИНА ФАКТОВ И ИНТЕРПРЕТАЦИИ:
+— Сначала проверь, что утверждение буквально присутствует в переданных данных карты.
+— Не придумывай аспекты, дома, управителей, соляр/лунар, узлы, атмакараку, D-10, даши или каналы, если они не выведены в данных.
+— Если нужного расчёта нет, прямо скажи: «этого показателя сейчас нет в расчёте» — и не подменяй его догадкой.
+— Астрология и Дизайн Человека здесь используются как символические системы саморефлексии, а не как научный диагноз, медицинское заключение или гарантированный прогноз.
+— Совпадение двух символических систем — это интерпретативная гипотеза, не доказанный факт. Формулируй «обе системы указывают на одну тему», а не «это точно про человека».
+— В теме здоровья не называй диагнозы и конкретные симптомы как установленный факт; предлагай обратиться к врачу при жалобах.
 """
 
-def _ask_ai_sync(user_id: int, message: str) -> str:
+def _ask_claude_sync(user_id: int, message: str) -> str:
     user = users.get(user_id, {})
     history = user.get("history", [])
 
@@ -325,6 +538,7 @@ def _ask_ai_sync(user_id: int, message: str) -> str:
         chart_str = chart.get("raw", json.dumps(chart, ensure_ascii=False))
         hd_str = hd.get("raw", json.dumps(hd, ensure_ascii=False))
         hd_library_context = get_hd_context(hd)
+        variables_context = get_phs_context(hd)
 
         # Блоки которые уже были разобраны
         seen_blocks = user.get("blocks_seen", [])
@@ -342,10 +556,13 @@ def _ask_ai_sync(user_id: int, message: str) -> str:
             f"\n\nКАРТА ПОЛЬЗОВАТЕЛЯ (астрология):\n{chart_str}"
             f"\n\nHD ПОЛЬЗОВАТЕЛЯ (сырые данные):\n{hd_str}"
             f"\n\nHD БИБЛИОТЕКА (описания типа, авторитета, центров, каналов, ворот):\n{hd_library_context}"
+            f"\n\nHD ПЕРЕМЕННЫЕ (отдельно от линий; тело, среда, взгляд, мотивация):\n{variables_context}"
             f"{blocks_note}"
         )
 
-    request_history = history + [
+    # Контекст карты добавляем к текущему запросу, а не дублируем его во всей
+    # истории. При этом сохраняем fallback между настроенными провайдерами.
+    request_history = history[-12:] + [
         {"role": "user", "content": message + context if not history else message}
     ]
 
@@ -395,99 +612,15 @@ def _ask_ai_sync(user_id: int, message: str) -> str:
     history = request_history
     history.append({"role": "assistant", "content": reply})
 
-    users[user_id]["history"] = history[-20:]
+    users[user_id]["history"] = history[-12:]
     return reply
 
-async def ask_ai(user_id: int, message: str) -> str:
-    return await asyncio.to_thread(_ask_ai_sync, user_id, message)
+async def ask_claude(user_id: int, message: str) -> str:
+    return await asyncio.to_thread(_ask_claude_sync, user_id, message)
 
 
-TELEGRAM_TEXT_CHUNK_SIZE = 3800
-
-
-def split_telegram_text(text: str, limit: int = TELEGRAM_TEXT_CHUNK_SIZE) -> list[str]:
-    """Делит длинный ответ по абзацам, не превышая лимит Telegram."""
-    remaining = (text or "").strip()
-    chunks: list[str] = []
-
-    while len(remaining) > limit:
-        cut = remaining.rfind("\n\n", 0, limit + 1)
-        if cut < limit // 2:
-            cut = remaining.rfind("\n", 0, limit + 1)
-        if cut < limit // 2:
-            cut = remaining.rfind(" ", 0, limit + 1)
-        if cut <= 0:
-            cut = limit
-
-        chunk = remaining[:cut].strip()
-        if chunk:
-            chunks.append(chunk)
-        remaining = remaining[cut:].lstrip()
-
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-async def send_ai_reply(message, text: str):
-    """Делит длинный ответ и повторяет отправку без Markdown при ошибке разметки."""
-    for chunk in split_telegram_text(text):
-        try:
-            await message.reply_text(chunk, parse_mode="Markdown")
-        except BadRequest as exc:
-            error_text = str(exc).lower()
-            if "parse entities" not in error_text and "end of the entity" not in error_text:
-                raise
-            print(f"Telegram Markdown fallback: {type(exc).__name__}: {exc}", flush=True)
-            await message.reply_text(chunk)
-
-
-def friendly_ai_error(exc: Exception) -> tuple[str, str]:
-    """Преобразует ошибку API в безопасное сообщение без секретов."""
-    error_text = str(exc).lower()
-    if any(marker in error_text for marker in (
-        "insufficient_quota", "credit balance", "current quota",
-        "billing_hard_limit_reached", "billing",
-    )):
-        return "AI_BALANCE", (
-            "На балансе AI API недостаточно средств или оплата ещё не активировалась. "
-            "Проверь Billing и попробуй снова через несколько минут."
-        )
-    if any(marker in error_text for marker in (
-        "invalid_api_key", "authentication", "incorrect api key",
-        "unauthorized", "error code: 401",
-    )):
-        return "AI_KEY", (
-            "AI-сервис отклонил ключ. Проверь, что в Railway вставлен полный ключ без скобок и пробелов."
-        )
-    if "model" in error_text and any(marker in error_text for marker in (
-        "not found", "does not exist", "access", "unsupported", "error code: 404",
-    )):
-        return "AI_MODEL", (
-            "У API-аккаунта нет доступа к выбранной модели. Проверь название модели в Railway."
-        )
-    if any(marker in error_text for marker in ("rate limit", "too many requests", "error code: 429")):
-        return "AI_LIMIT", (
-            "AI-сервис временно ограничил количество запросов. Подожди минуту и попробуй снова."
-        )
-    return "AI_UNAVAILABLE", (
-        "AI-сервис сейчас не смог сформировать разбор. Настройки карты сохранены — попробуй снова чуть позже."
-    )
-
-
-async def alert_runtime_error(ctx: ContextTypes.DEFAULT_TYPE, stage: str, exc: Exception):
-    """Немедленно сообщает владельцу причину, если задан ALERT_CHAT_ID."""
-    alert_chat_id = os.environ.get("ALERT_CHAT_ID", "").strip()
-    if not alert_chat_id:
-        return
-    detail = str(exc).replace("`", "'")[:1800]
-    try:
-        await ctx.bot.send_message(
-            chat_id=alert_chat_id,
-            text=f"⚠️ Аполлон: ошибка на этапе {stage}\n{type(exc).__name__}: {detail}",
-        )
-    except Exception as alert_exc:
-        print(f"Could not send runtime alert: {type(alert_exc).__name__}: {alert_exc}", flush=True)
+# Единое имя для новых обработчиков; старые сценарии сохраняют совместимость.
+ask_ai = ask_claude
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
 
@@ -582,13 +715,42 @@ CITIES = {
     "сочи": (43.5992, 39.7257, 3),
 }
 
-def parse_city(text: str):
+CITY_TIMEZONES = {
+    # Города/страны, для которых фиксированный UTC из старого словаря был
+    # недостаточен: смещение зависит от даты (летнее время).
+    "польша": "Europe/Warsaw", "poland": "Europe/Warsaw",
+    "суленцин": "Europe/Warsaw", "sulecin": "Europe/Warsaw",
+    "варшава": "Europe/Warsaw",
+    "германия": "Europe/Berlin", "берлин": "Europe/Berlin",
+    "франция": "Europe/Paris", "париж": "Europe/Paris",
+    "чехия": "Europe/Prague", "прага": "Europe/Prague",
+    "великобритания": "Europe/London", "лондон": "Europe/London",
+}
+
+def _date_utc_offset(tz_name: str, birth: dict | None):
+    """Возвращает фактический offset для даты рождения, включая DST."""
+    if not birth:
+        return None
+    try:
+        local = datetime(int(birth["year"]), int(birth["month"]), int(birth["day"]),
+                         int(birth.get("hour", 12)), int(birth.get("minute", 0)),
+                         tzinfo=ZoneInfo(tz_name))
+        return local.utcoffset().total_seconds() / 3600
+    except Exception:
+        return None
+
+def parse_city(text: str, birth: dict | None = None):
     key = text.lower().strip()
+    tz_name = next((tz for city, tz in CITY_TIMEZONES.items() if city in key), None)
     if key in CITIES:
-        return CITIES[key]
+        lat, lon, fallback_utc = CITIES[key]
+        offset = _date_utc_offset(tz_name, birth) if tz_name else None
+        return lat, lon, fallback_utc if offset is None else offset
     for city, data in CITIES.items():
         if city in key or key in city:
-            return data
+            lat, lon, fallback_utc = data
+            offset = _date_utc_offset(tz_name, birth) if tz_name else None
+            return lat, lon, fallback_utc if offset is None else offset
     # Геокодер Nominatim для любого города
     try:
         query = urllib.parse.urlencode({"q": text, "format": "json", "limit": 1})
@@ -599,8 +761,10 @@ def parse_city(text: str):
         if results:
             lat = float(results[0]["lat"])
             lon = float(results[0]["lon"])
-            # Определяем UTC offset по долготе (приблизительно)
-            utc = round(lon / 15)
+            # Для известных зон учитываем летнее время; для неизвестной точки
+            # оставляем приблизительный offset и явно не выдаём его за IANA-зону.
+            offset = _date_utc_offset(tz_name, birth) if tz_name else None
+            utc = round(lon / 15) if offset is None else offset
             return (lat, lon, utc)
     except Exception:
         pass
@@ -610,7 +774,15 @@ def parse_city(text: str):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    users[uid] = {"history": [], "trial_start": datetime.now()}
+    saved = db_load_user(uid)
+    # Для нового пользователя отсчёт начинается после согласия, а не в момент
+    # случайного нажатия /start.
+    trial_start = saved.get("trial_start") if saved else None
+    users[uid] = {
+        "history": [],
+        "trial_start": trial_start,
+        "brand_data": saved.get("brand_data", {}) if saved else {},
+    }
 
     consent_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Принимаю и продолжаю", callback_data="consent_yes")],
@@ -619,10 +791,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Прежде чем начать — важный момент.\n\n"
         "Для анализа мне нужны твои дата, время и место рождения. "
-        "Они сохраняются в базе сервиса для восстановления карты. "
-        "Для формирования персонального разбора данные и результаты расчёта передаются "
-        "подключённому поставщику AI API.\n\n"
-        "Нажимая «Принимаю», ты соглашаешься с описанной обработкой этих данных.\n\n"
+        "Эти данные хранятся в защищённой базе и используются только для расчёта твоей карты. "
+        "Мы не передаём их третьим лицам.\n\n"
+        "Первые 3 дня доступ к разбору и прогнозам бесплатный.\n\n"
+        "Нажимая «Принимаю», ты соглашаешься с обработкой этих данных в соответствии "
+        "с нашей политикой конфиденциальности.\n\n"
         "По вопросам: @danilkina",
         reply_markup=consent_kb
     )
@@ -688,7 +861,7 @@ async def ask_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     city = update.message.text.strip()
-    coords = parse_city(city)
+    coords = parse_city(city, users[uid].get("birth"))
     if not coords:
         await update.message.reply_text(
             f"Не нашёл координаты для «{city}». "
@@ -704,7 +877,6 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Смотрю в карту. Боги собираются...")
 
-    stage = "CALCULATION"
     try:
         natal, hd = await calculate_chart(users[uid]["birth"])
         users[uid]["chart"] = natal
@@ -718,9 +890,10 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if "Тип:" in line or "TYPE" in line.upper():
                 hd_type = line.strip()
                 break
-        db_save_user(uid, username, users[uid]["name"], users[uid]["birth"], hd_type)
+        db_save_user(uid, username, users[uid]["name"], users[uid]["birth"], hd_type,
+                     trial_started=users[uid].get("trial_start"))
 
-        # Просим AI построить первый разбор
+        # Просим Claude построить первый разбор
         b = users[uid]["birth"]
         name = users[uid]['name']
         prompt = (
@@ -733,10 +906,9 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "а точным описанием что этот человек делает иначе и где это его подводит. "
             "Используй карту — конкретные боги с конкретными характерами, не абстракции."
         )
-        stage = "AI"
-        reply = await ask_ai(uid, prompt)
-        stage = "TELEGRAM"
-        await send_ai_reply(update.message, reply)
+        reply = await ask_claude(uid, prompt)
+        await safe_send(update.message, reply)
+        await update.message.reply_text(trial_banner(uid))
         await update.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
         return CHAT
@@ -744,25 +916,16 @@ async def ask_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         import traceback
         err = traceback.format_exc()
-        print(f"ERROR in ask_place [{stage}]: {err}", flush=True)
-        await alert_runtime_error(ctx, stage, e)
-        if stage == "AI":
-            error_code, error_message = friendly_ai_error(e)
-            await update.message.reply_text(f"{error_message}\n\nКод ошибки: {error_code}")
-        elif stage == "TELEGRAM":
-            await update.message.reply_text(
-                "Разбор готов, но Telegram не смог его доставить. Попробуй ещё раз через минуту.\n\n"
-                "Код ошибки: TELEGRAM_SEND"
-            )
-        else:
-            await update.message.reply_text(
-                "Не удалось завершить расчёт карты. Попробуй начать заново через /start.\n\n"
-                "Код ошибки: CALCULATION"
-            )
+        print(f"ERROR in ask_place: {err}")
+        await update.message.reply_text(
+            "Упс... Посейдон разлил воду и всё немного сломалось. "
+            "Боги уже чинят. Попробуй написать /start чтобы начать заново."
+        )
         return ConversationHandler.END
 
 
 MENU_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🧩 Упаковать себя и продукты", callback_data="brand_menu")],
     [InlineKeyboardButton("✨ Мой характер и таланты", callback_data="block_identity")],
     [InlineKeyboardButton("🎯 Предназначение",         callback_data="block_mission")],
     [InlineKeyboardButton("❤️ Отношения",              callback_data="block_love")],
@@ -780,6 +943,334 @@ FORECAST_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🌟 На год", callback_data="forecast_year")],
     [InlineKeyboardButton("← Назад", callback_data="back_to_menu")],
 ])
+
+# ─── БРЕНДОВЫЙ КОМПАС ────────────────────────────────────────────────────────
+
+BRAND_ARCHETYPES = {
+    "Афина": {
+        "promise": "ясность, стратегия и точное решение сложной задачи",
+        "shadow": "говорить сверху вниз и превращать живой бренд в лекцию",
+        "formats": "разборы, схемы, кейсы, методологии",
+    },
+    "Аполлон": {
+        "promise": "смысл, видение и способность собрать хаос в ясную картину",
+        "shadow": "слишком долго объяснять очевидное и бояться простоты",
+        "formats": "манифесты, концепции, редакционные тексты, публичные выступления",
+    },
+    "Гермес": {
+        "promise": "быстрая связь, движение, продажи и умение донести мысль",
+        "shadow": "распыляться и менять направление раньше результата",
+        "formats": "короткие видео, сторителлинг, коллаборации, прямые эфиры",
+    },
+    "Афродита": {
+        "promise": "притяжение, вкус и желание быть рядом с брендом",
+        "shadow": "подменять ценность красивой оболочкой",
+        "formats": "визуальные истории, кейсы-ощущения, предметные съёмки, комьюнити",
+    },
+    "Артемида": {
+        "promise": "свобода, собственная территория и узнаваемая независимость",
+        "shadow": "уходить в дистанцию и не объяснять ценность тем, кто ещё не свой",
+        "formats": "нишевые медиа, сильные позиции, полевые заметки, личный бренд",
+    },
+    "Гефест": {
+        "promise": "мастерство, качество и вещь, которая действительно работает",
+        "shadow": "прятаться за продуктом и недооценивать упаковку",
+        "formats": "процесс, бэкстейдж, доказательства, до/после, продуктовые кейсы",
+    },
+    "Дионис": {
+        "promise": "переживание, перемена и разрешение человеку стать другим",
+        "shadow": "строить драму вместо понятного предложения",
+        "formats": "истории трансформации, живые эфиры, провокации, события",
+    },
+    "Деметра": {
+        "promise": "забота, рост и ощущение безопасного пространства",
+        "shadow": "отдавать слишком много и размывать границы предложения",
+        "formats": "обучение, поддерживающий контент, клубы, серии писем",
+    },
+    "Зевс": {
+        "promise": "масштаб, авторитет и право задавать направление",
+        "shadow": "становиться недоступным или обещать больше, чем выдерживает система",
+        "formats": "исследования, публичные позиции, стратегические выступления, партнёрства",
+    },
+    "Гестия": {
+        "promise": "доверие, камерность и пространство, в котором можно быть собой",
+        "shadow": "оставаться незаметной и не переводить глубину в продажу",
+        "formats": "письма, закрытые сообщества, медленные форматы, личные диалоги",
+    },
+}
+
+BRAND_QUESTIONS = [
+    {
+        "key": "role",
+        "text": "В роли бренда тебе естественнее всего…",
+        "options": [
+            ("lead", "Задавать направление", ["Зевс", "Аполлон", "Афина"]),
+            ("connect", "Соединять людей и идеи", ["Гермес", "Деметра"]),
+            ("create", "Создавать вещь или метод", ["Гефест", "Афина"]),
+            ("transform", "Менять состояние человека", ["Дионис", "Афродита"]),
+        ],
+    },
+    {
+        "key": "trust",
+        "text": "За что тебе должны доверять?",
+        "options": [
+            ("clarity", "За ясность и точность", ["Афина", "Аполлон"]),
+            ("taste", "За вкус и чувство формы", ["Афродита", "Аполлон"]),
+            ("proof", "За результат и мастерство", ["Гефест", "Зевс"]),
+            ("care", "За внимание и поддержку", ["Деметра", "Гестия"]),
+        ],
+    },
+    {
+        "key": "rhythm",
+        "text": "Какой темп продвижения тебе подходит?",
+        "options": [
+            ("fast", "Быстро, коротко, много контактов", ["Гермес", "Дионис"]),
+            ("deep", "Редко, но глубоко", ["Гестия", "Аполлон"]),
+            ("steady", "Последовательно и надолго", ["Деметра", "Гефест"]),
+            ("bold", "Резко и с сильной позицией", ["Зевс", "Артемида"]),
+        ],
+    },
+    {
+        "key": "audience",
+        "text": "Что должно происходить с аудиторией после контакта?",
+        "options": [
+            ("act", "Она принимает решение", ["Зевс", "Гермес"]),
+            ("see", "Она начинает видеть шире", ["Аполлон", "Афина"]),
+            ("feel", "Она чувствует желание и притяжение", ["Афродита", "Дионис"]),
+            ("belong", "Она чувствует: я в безопасном месте", ["Деметра", "Гестия"]),
+        ],
+    },
+    {
+        "key": "visual",
+        "text": "Какая визуальная среда ближе?",
+        "options": [
+            ("editorial", "Редакционная ясность и структура", ["Аполлон", "Афина"]),
+            ("sensual", "Фактура, свет, тело, желание", ["Афродита", "Дионис"]),
+            ("raw", "Материал, процесс, настоящая работа", ["Гефест", "Артемида"]),
+            ("warm", "Тепло, дом, близость, ритуал", ["Деметра", "Гестия"]),
+        ],
+    },
+    {
+        "key": "sales",
+        "text": "Как тебе легче продавать?",
+        "options": [
+            ("explain", "Через систему и аргументы", ["Афина", "Аполлон"]),
+            ("show", "Через демонстрацию результата", ["Гефест", "Зевс"]),
+            ("invite", "Через контакт и разговор", ["Гермес", "Деметра"]),
+            ("desire", "Через образ будущего и желание", ["Афродита", "Дионис"]),
+        ],
+    },
+]
+
+BRAND_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🧩 Собрать себя заново", callback_data="brand_start")],
+    [InlineKeyboardButton("📘 Профиль и позиционирование", callback_data="brand_passport")],
+    [InlineKeyboardButton("✍️ Контент из компетенций", callback_data="brand_content")],
+    [InlineKeyboardButton("💬 Мой ИИ-редактор · PRO", callback_data="brand_ai_chat")],
+    [InlineKeyboardButton("← В главное меню", callback_data="back_to_menu")],
+])
+
+
+def score_brand_archetypes(answers: list[str]) -> list[tuple[str, int]]:
+    scores = {name: 0 for name in BRAND_ARCHETYPES}
+    for answer in answers:
+        for question in BRAND_QUESTIONS:
+            for key, _, archetypes in question["options"]:
+                if key == answer:
+                    for archetype in archetypes:
+                        scores[archetype] += 1
+    return sorted(scores.items(), key=lambda item: (-item[1], list(BRAND_ARCHETYPES).index(item[0])))
+
+
+def brand_question_keyboard(question_index: int) -> InlineKeyboardMarkup:
+    question = BRAND_QUESTIONS[question_index]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"brand_answer:{question_index}:{key}")]
+        for key, label, _ in question["options"]
+    ])
+
+
+def brand_context(uid: int) -> str:
+    data = users[uid].get("brand_data", {})
+    ranked = data.get("archetypes", [])
+    archetype_text = "\n".join(
+        f"- {name}: {score} балл(а). Обещание: {BRAND_ARCHETYPES[name]['promise']}. "
+        f"Тень: {BRAND_ARCHETYPES[name]['shadow']}. Форматы: {BRAND_ARCHETYPES[name]['formats']}"
+        for name, score in ranked[:3]
+        if name in BRAND_ARCHETYPES
+    ) or "Архетипический тест ещё не пройден."
+    return f"""ДАННЫЕ БРЕНДА:
+Название/имя: {data.get('brand_name', 'не указано')}
+Опыт, роли и проекты: {data.get('experience', 'не указано')}
+Продукты и услуги: {data.get('offer', 'не указано')}
+Для кого и какую проблему решает: {data.get('audience', 'не указано')}
+Цель на ближайший этап: {data.get('goal', 'не указано')}
+
+РЕЗУЛЬТАТ АРХЕТИПИЧЕСКОГО ТЕСТА:
+{archetype_text}
+
+ОТВЕТЫ ТЕСТА: {', '.join(data.get('answers', [])) or 'нет'}"""
+
+
+def build_brand_passport_prompt(uid: int) -> str:
+    name = users[uid].get("name", "")
+    chart = users[uid].get("chart", {}).get("raw", "")
+    hd = users[uid].get("hd", {}).get("raw", "")
+    hd_context = get_hd_context(users[uid].get("hd", {}))
+    return f"""Собери профессиональную упаковку для {name}. Это не гороскоп и не общий совет по маркетингу.
+Перед тобой человек с опытом, ролями, проектами и, возможно, несколькими продуктами.
+Твоя задача — вынуть из этого хаоса устойчивые компетенции, собрать их в ясную
+систему и перевести в язык, которым человек сможет говорить о себе и продавать.
+
+{brand_context(uid)}
+
+НАТАЛЬНАЯ АСТРОЛОГИЯ:
+{chart}
+
+ДИЗАЙН ЧЕЛОВЕКА:
+{hd}
+{hd_context}
+
+Правила:
+- Не объявляй архетип доказанным типом личности: называй его рабочей гипотезой.
+- Не придумывай аудиторию, продукт или опыт, которых нет в данных.
+- Не пересказывай карту техническими терминами. Используй её как основание для
+  рекомендаций по темпу, голосу, способу продаж и формату контента.
+- Не называй человека профессией вместо действия: не «маркетолог», а «умеет
+  превращать сложный материал в ясную стратегию». Каждую компетенцию формулируй
+  через глагол и результат.
+- Не давай универсальный список «постить каждый день». У бренда должен быть свой ритм.
+
+Структура:
+1. Что в опыте человека является ядром, а что — отдельными ветками.
+2. Карта ключевых компетенций в формате «Я умею + глагол + результат + для кого».
+3. Иерархия продуктов: флагман, входной продукт, дополнительные направления.
+4. Одно точное позиционирование без названия профессии.
+5. Главный архетип, скрытая сила и тень — как рабочая гипотеза, а не диагноз.
+6. Роль бренда в жизни клиента и конкретное обещание.
+7. Личный язык: словарь, темп, интонация, что говорить и чего не говорить.
+8. Три контентные опоры и подходящие форматы продвижения.
+9. Один практический эксперимент на ближайшие 7 дней.
+
+Пиши ясным профессиональным русским языком. В начале допустима короткая сцена с богами,
+но дальше должен быть рабочий документ, который можно сразу использовать в брендинге."""
+
+
+def build_brand_content_prompt(uid: int) -> str:
+    return f"""Составь контентную неделю для бренда.
+
+{brand_context(uid)}
+
+Используй прежде всего реальные компетенции, продукты, опыт и цель человека.
+Личную карту применяй только как ограничитель голоса, темпа и способа контакта,
+а не как повод придумывать факты. Не повторяй одинаковые темы.
+
+Сначала сформулируй 3–5 компетенций в формате «Я умею…», затем дай 7 публикаций:
+- тема и сильный заголовок;
+- задача публикации (доверие, охват, прогрев, продажа или удержание);
+- формат;
+- тезис поста или сценарий короткого видео;
+- мягкий призыв к действию.
+
+В конце добавь: какой ритм публикаций выдержит этот бренд и какой формат ему лучше не навязывать.
+Пиши конкретно, без «просто будьте собой» и без шаблонных советов."""
+
+
+async def generate_brand_passport(uid: int) -> str:
+    return await ask_claude(uid, build_brand_passport_prompt(uid))
+
+
+async def generate_brand_content(uid: int) -> str:
+    return await ask_claude(uid, build_brand_content_prompt(uid))
+
+
+def build_brand_chat_prompt(uid: int, user_text: str) -> str:
+    name = users[uid].get("name", "")
+    chart = users[uid].get("chart", {}).get("raw", "")
+    hd = users[uid].get("hd", {}).get("raw", "")
+    return f"""Ты — рабочий ИИ-редактор бренда {name}. Помогай не рассуждать об архетипах,
+а принимать конкретные решения по упаковке, продуктам, позиционированию,
+маркетингу, текстам и продвижению.
+
+{brand_context(uid)}
+
+ЛИЧНАЯ КАРТА ДЛЯ НАСТРОЙКИ ГОЛОСА:
+{chart}
+{hd}
+
+Запрос пользователя:
+{user_text}
+
+Правила:
+- сначала назови, что именно нужно решить;
+- если в исходных данных хаос, разложи его на 2–4 части;
+- формулируй действия через глаголы и результат;
+- не называй человека только профессией;
+- не выдумывай факты, аудиторию или доказательства;
+- в конце дай один следующий шаг, который можно сделать сегодня.
+Пиши кратко, конкретно и живым профессиональным русским языком."""
+
+
+async def start_brand_flow(message_obj, uid: int):
+    users[uid]["brand_ai_chat"] = False
+    users[uid]["brand_flow"] = {"stage": "name", "answers": []}
+    await message_obj.reply_text(
+        "Начнём с реального бренда, а не с абстрактного архетипа.\n\n"
+        "Как называется проект или как ты называешь своё имя как бренд?"
+    )
+
+
+async def handle_brand_text(update: Update, uid: int) -> bool:
+    """Обрабатывает три фактических вопроса брендовой диагностики."""
+    flow = users[uid].get("brand_flow", {})
+    data = users[uid].setdefault("brand_data", {})
+    text = update.message.text.strip()
+    stage = flow.get("stage")
+    if not text:
+        await update.message.reply_text("Напиши, пожалуйста, одним-двумя предложениями.")
+        return True
+
+    if stage == "name":
+        data["brand_name"] = text
+        flow["stage"] = "experience"
+        await update.message.reply_text(
+            "Что ты уже умеешь и через какие проекты прошла?\n"
+            "Можно написать хаотично: роли, клиенты, навыки, темы, опыт, за который тебя ценили."
+        )
+        return True
+    if stage == "experience":
+        data["experience"] = text
+        flow["stage"] = "offer"
+        await update.message.reply_text(
+            "Какие продукты или услуги у тебя есть сейчас — или ты хочешь их собрать?"
+        )
+        return True
+    if stage == "offer":
+        data["offer"] = text
+        flow["stage"] = "audience"
+        await update.message.reply_text("Для кого это и какую проблему ты помогаешь решить?")
+        return True
+    if stage == "audience":
+        data["audience"] = text
+        flow["stage"] = "goal"
+        await update.message.reply_text(
+            "Чего ты хочешь на ближайшем этапе: выбрать главное направление, "
+            "упаковать продукт, поднять цену, выйти в публичность или привлечь клиентов?"
+        )
+        return True
+    if stage == "goal":
+        data["goal"] = text
+        flow["stage"] = "quiz"
+        flow["question_index"] = 0
+        users[uid]["brand_data"] = data
+        users[uid]["brand_flow"] = flow
+        db_save_brand(uid, data)
+        await update.message.reply_text(
+            BRAND_QUESTIONS[0]["text"],
+            reply_markup=brand_question_keyboard(0),
+        )
+        return True
+    return False
 
 # Универсальное описание типов — вставляется в каждый блок
 HD_TYPE_STRATEGY = """ТИПЫ, СТРАТЕГИИ И АВТОРИТЕТЫ — применяй к данному запросу:
@@ -800,7 +1291,10 @@ HD_TYPE_STRATEGY = """ТИПЫ, СТРАТЕГИИ И АВТОРИТЕТЫ — �
 
 ПРОФИЛЬ определяет тактику — детальное описание профиля этого человека уже есть в данных HD БИБЛИОТЕКА, используй его."""
 
-BLOCK_PROMPTS = {
+# Архивная версия промптов. Не используется: ниже объявлен единый редакционный
+# `BLOCK_PROMPTS`, построенный на PLAIN_READING_RULES. Оставлена временно для
+# безопасного сравнения при чистке старых формулировок.
+_LEGACY_BLOCK_PROMPTS = {
     "block_identity": f"""АКЦЕНТ: характер и таланты.
 
 Ты делаешь синтез двух карт — астрологии и Дизайна Человека. Сначала анализ каждой системы, потом синтез.
@@ -820,7 +1314,7 @@ BLOCK_PROMPTS = {
 ШАГ 3 — СИНТЕЗ:
 Начни с одного живого абзаца — 3-4 бога заняли территории, можно назвать знаки ТОЛЬКО здесь.
 Потом — без знаков и позиций, только характер:
-• Где HD и астрология говорят одно — это факт, говори уверенно
+• Где HD и астрология говорят одно — обозначь это как сходную тему двух символических систем
 • Суперсила конкретно (не "ты чувствуешь глубже" — а что именно)
 • Ловушка конкретно — один паттерн который дорого стоит
 • Кем воспринимают другие vs кто есть на самом деле
@@ -846,7 +1340,7 @@ BLOCK_PROMPTS = {
 • Юпитер (дом) — где расцветает и везёт
 
 ШАГ 3 — СИНТЕЗ:
-• Где HD и астрология совпадают — говори уверенно, это факт
+• Где HD и астрология совпадают — обозначь сходную тему и отдели расчёт от интерпретации
 • Назови конкретные сферы (психолог, художник, предприниматель, преподаватель...)
 • Формат реализации: с людьми или без, создаёт или передаёт, ведёт или поддерживает
 • Главное условие которое должно быть соблюдено чтобы поток открылся
@@ -913,7 +1407,7 @@ BLOCK_PROMPTS = {
 • 2й дом (знак + планеты) — личные ресурсы и ценности
 • Правитель 2го дома (его дом) — путь к деньгам через эту сферу
 • 8й дом — чужие деньги, трансформация ресурсов, скрытые источники
-• Парс Фортуны (дом) — точка удачи и процветания: в каком доме стоит = сфера где деньги и успех идут легче всего. Что нужно делать чтобы активировать эту точку.
+• Парс Фортуны используй только если он явно присутствует в данных; иначе не делай выводов о нём.
 • Юпитер (дом) — расширение и удача; Сатурн (дом) — где ограничение требует структуры
 • Узловая ось (дома): Северный узел = направление где деньги связаны с ростом; Южный = откуда легко но тянет назад
 • Плутон — где идёт трансформация финансовых паттернов через власть
@@ -950,7 +1444,7 @@ BLOCK_PROMPTS = {
 • Узловая ось (дома): что Северный узел говорит о теме заботы о себе
 
 ШАГ 3 — СИНТЕЗ:
-• Где тело даёт сигналы — конкретные симптомы или паттерны
+• Где тело даёт сигналы — только общие паттерны самонаблюдения, без диагнозов и утверждений о симптомах
 • Хроническое напряжение: откуда берётся
 • Что этот человек делает с телом что вредит — один точный паттерн
 • Что изменить конкретно
@@ -992,49 +1486,153 @@ BLOCK_PROMPTS = {
 Максимум 5 абзацев. Один точный вопрос в конце.""",
 }
 
+# ─── НОВАЯ РЕДАКЦИОННАЯ МЕТОДОЛОГИЯ ─────────────────────────────────────────
+# Старые черновые инструкции оставлены выше для истории проекта, но в работе
+# используется эта версия: она разделяет факты, смысловые линзы блоков и уже
+# разобранные темы. Технические названия нужны только внутри контекста модели,
+# в пользовательский текст они не попадают.
+PLAIN_READING_RULES = """
+ОБЩИЕ ПРАВИЛА ЧТЕНИЯ:
+1. Начни с короткой живой сцены на Олимпе: используй только богов планет, которые действительно есть в переданных данных. 1–2 предложения, без длинного вступления.
+2. Затем сразу расскажи о человеке человеческим языком. Не называй технические названия Дизайна Человека, номера профиля, линий, центров, каналов, ворот, домов и аспектов.
+3. Разбирай сначала механику Дизайна: способ действовать, способ принимать решения, характер взаимодействия с людьми, устойчивые и восприимчивые зоны, затем соединяй это с полной западной картой.
+4. Каждое важное наблюдение привяжи к конкретным данным. Если поля нет, не угадывай и не заменяй его общим стереотипом.
+5. Повтор уже разобранных блоков не пересказывай. Можно сделать одну короткую ссылку на ранее найденный паттерн, но новый блок должен дать новый материал.
+6. Планеты можно называть в повествовании («твоё Солнце», «твоя Венера»). Остальные технические слова переводи в действие, выбор, реакцию или ситуацию.
+7. Не выдавай символическую интерпретацию за доказанный факт, медицинский диагноз или гарантированное событие. В теме здоровья говори только о самонаблюдении.
+8. Финал — одно точное наблюдение или вопрос по теме блока и короткая ироническая реплика богов.
+"""
+
+BLOCK_PROMPTS = {
+    "block_identity": PLAIN_READING_RULES + """
+ЛИНЗА БЛОКА: ХАРАКТЕР И ТАЛАНТЫ.
+Это базовый портрет, поэтому не уходи в деньги, здоровье, прогнозы и подробности отношений.
+Используй: способ действовать и принимать решения; обе линии профиля из библиотеки; все устойчивые и открытые центры; все активации планет и тексты линий; Солнце, Луну, Асцендент, Меркурий, Венеру, Марс; доминирующие планеты и рассчитанные аспекты.
+Структура: как человек входит в действие; как его видят; что у него получается естественно; один точный внутренний конфликт; что обычно ошибочно принимают за его слабость.
+5–6 абзацев. Не повторяй формулировки из ранее разобранных блоков.
+""",
+    "block_mission": PLAIN_READING_RULES + """
+ЛИНЗА БЛОКА: НАПРАВЛЕНИЕ ЖИЗНИ И РЕАЛИЗАЦИЯ.
+Не пересказывай портрет личности. Ищи, куда человек вкладывает жизнь и в каком формате приносит пользу.
+Используй: четыре точки креста и тексты линий из библиотеки; все планетные активации, особенно Солнце и Землю; устойчивые центры и каналы как способы действия; Северный и Южный узлы с домами; Асцендент, МС, планеты в десятом доме, Солнце и Юпитер; рассчитанные аспекты к этим точкам.
+Не называй профессию как судьбу. Опиши 2–3 подходящих формата реализации, условие включения и один риск свернуть не туда.
+5–6 абзацев. Не повторяй характер и ресурсный режим.
+""",
+    "block_love": PLAIN_READING_RULES + """
+ЛИНЗА БЛОКА: БЛИЗОСТЬ И ПАРТНЁРСТВО.
+Не повторяй общий портрет и не объясняй всю механику Дизайна заново — покажи, как она проявляется именно в отношениях.
+Используй: Венеру, Марс, Луну, Солнце; пятый, седьмой и восьмой дома и планеты в них; аспекты Венеры/Марса/Луны; узловую ось в домах; открытые центры; найденные в Love Book ворота и каналы, но только при наличии источника.
+Расскажи: кого человек впускает; что создаёт притяжение; где возникает напряжение; какой повторяющийся способ разрушает близость; какой разговор или договор помогает.
+6–7 абзацев. Не делай выводов о втором человеке без его карты.
+""",
+    "block_money": PLAIN_READING_RULES + """
+ЛИНЗА БЛОКА: ДЕНЬГИ, ЦЕНА И ОБМЕН.
+Не повторяй предназначение и общую самооценку. Говори о том, как человек создаёт ценность, назначает цену, принимает финансовые решения и входит в обмен.
+Используй: второй, восьмой и одиннадцатый дома и планеты в них; Венеру, Юпитер, Сатурн, Плутон и их рассчитанные аспекты; узловую ось в домах; устойчивость воли и рабочего ресурса в данных Дизайна; специальные ворота денег только с библиотечным описанием.
+Парс Фортуны используй только если он реально рассчитан и передан. Не придумывай управителей домов.
+Дай четыре части рассказа: откуда приходит ценность; что мешает брать оплату; какая модель обмена подходит; один проверяемый эксперимент на ближайший месяц.
+5–6 абзацев, без вопроса в конце.
+""",
+    "block_health": PLAIN_READING_RULES + """
+ЛИНЗА БЛОКА: ТЕЛО И ПОВСЕДНЕВНАЯ НАГРУЗКА.
+Это не медицинская консультация. Не называй болезни, диагнозы, симптомы и лечение как вывод карты.
+Используй: устойчивые и открытые центры; корневое давление, селезёночные сигналы и эмоциональную нагрузку только как метафоры самонаблюдения; шестой и двенадцатый дома; Луну, Сатурн и их рассчитанные аспекты; узловую ось в домах.
+Опиши: что перегружает режим; как человек замечает, что пора остановиться; какой повторяющийся способ обращения с телом истощает; какой мягкий эксперимент с режимом можно наблюдать.
+4–5 абзацев и осторожная фраза о враче при реальных жалобах.
+""",
+    "block_resources": PLAIN_READING_RULES + """
+ЛИНЗА БЛОКА: ВОССТАНОВЛЕНИЕ, СРЕДА И РИТМ.
+Это отдельный блок, поэтому не повторяй здоровье и не описывай симптомы.
+Используй четыре PHS-переменные только из переданного контекста и только с теми описаниями, которые найдены в источнике; затем добавь устойчивые/открытые центры, Луну, Нептун, двенадцатый дом и рассчитанные аспекты.
+Расскажи: какая среда поддерживает; что перегружает восприятие; какой способ питания/режима подходит как эксперимент; где человеку нужен контакт, а где тишина.
+5 абзацев. Не называй PHS, цвет, тон и стрелки в пользовательском тексте.
+""",
+}
+
 async def send_menu(update: Update):
     await update.message.reply_text(
         "Боги приглашают тебя исследовать свой пантеон. С чего начнём?",
         reply_markup=MENU_KEYBOARD
     )
 
+async def collect_transit_snapshots(period: str, birth: dict, start: datetime) -> str:
+    """Собирает несколько честных срезов, чтобы не выдавать одну дату за период."""
+    offsets = {
+        "forecast_day": [0],
+        "forecast_month": [0, 7, 14, 21, 28],
+        "forecast_3months": [0, 14, 28, 42, 56, 70, 84],
+        "forecast_year": [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330],
+    }.get(period, [0])
+    snapshots = []
+    for offset in offsets:
+        day = start + timedelta(days=offset)
+        try:
+            raw = await call_mcp_async("transits", {
+                "birth_year": birth["year"], "birth_month": birth["month"],
+                "birth_day": birth["day"], "birth_hour": birth["hour"],
+                "birth_timezone": birth["utc_offset"], "lat": birth["lat"], "lon": birth["lon"],
+                "transit_year": day.year, "transit_month": day.month, "transit_day": day.day,
+            })
+            snapshots.append(f"Срез на {day.strftime('%d.%m.%Y')}:\n{raw.get('raw', str(raw))}")
+        except Exception as exc:
+            snapshots.append(f"Срез на {day.strftime('%d.%m.%Y')}: данные недоступны ({exc})")
+    return "\n\n".join(snapshots)
+
+
+# Версия прогноза с честной границей данных. Она переопределяет старый черновик
+# выше: модель видит несколько дат и не должна превращать один срез в обещание.
 def get_forecast_prompt(period: str, transits_data: str) -> str:
-    periods = {
-        "forecast_day":     "на сегодня",
-        "forecast_month":   "на ближайший месяц",
-        "forecast_3months": "на ближайшие три месяца",
-        "forecast_year":    "на год вперёд",
+    labels = {
+        "forecast_day": "срез на сегодня",
+        "forecast_month": "ближайший месяц",
+        "forecast_3months": "ближайшие три месяца",
+        "forecast_year": "ближайший год",
     }
-    label = periods[period]
+    return f"""Сделай ясный прогноз про {labels.get(period, 'этот период')}.
 
-    year_addition = ""
-    if period == "forecast_year":
-        year_addition = """
+Пиши как редактор аналитического разбора, а не как поток общих фраз. Сначала
+отдели расчёт от интерпретации.
 
-Это годовой прогноз. У тебя есть два источника данных — используй оба:
+ФОРМАТ ОТВЕТА:
 
-1. СОЛЯР (карта года) — это главный инструмент. Соляр показывает, какие темы и боги становятся ключевыми именно в этом году жизни. Обрати внимание на АСЦ соляра (тема года), планеты на углах, и аспекты соляра к натальным планетам — это конкретные события и зоны роста.
+1. **Заголовок периода.** Одна короткая формула, которая называет процесс:
+например, «Проверка старых договорённостей» или «Расширение через новый круг».
+Не используй слово «энергии» без объяснения, что именно меняется.
 
-2. ТРАНЗИТЫ — текущее положение планет. Показывают активные процессы прямо сейчас.
+2. **Период и основание.** Напиши даты только по переданным срезам. Если дан
+один срез, прямо скажи: «Это снимок на сегодня, а не прогноз на весь месяц».
+Назови 1–2 факта, на которых строится вывод: планета, знак, фаза, натальный дом,
+аспект или HD-активация.
 
-Не перечисляй аспекты — переводи их сразу на язык жизни: что происходит, что меняется, что созревает.
-"""
+3. **Главная конфигурация — только если она действительно рассчитана.**
+Если в данных явно есть оппозиция, квадрат, тригон или другая связка, опиши её
+в двух слоях:
+   • «Что рассчитано» — коротко и точно, с названиями планет и аспектов.
+   • «Что это значит» — перевод в решения, разговоры, нагрузку и реальные ситуации.
+Не называй «трапецией», «крестом» или другой фигурой то, чего нет отдельным
+расчётом в данных. Ничего не достраивай по красивой геометрии.
 
-    return f"""Сделай прогноз {label}.{year_addition}
+4. **Планеты по ролям.** Для каждой действительно важной планеты одна связка:
+«Факт → смысл → как это заметить». Ретроградность трактуй как возврат,
+пересмотр и повторную проверку, но не как автоматическую проблему.
 
-Это должно читаться как живой расклад — не советы, а картина того, что несёт этот период.
+5. **Как это проявится у человека.** Отдельно и конкретно:
+работа/деньги; отношения; внутреннее состояние. Не повторяй одну мысль в трёх
+разделах — если тема одна, назови её один раз и покажи три проявления.
 
-Структура (5-6 абзацев):
-1. *Главная тема периода* — одно чёткое название и объяснение: о чём этот период по сути. Не "напряжение", а конкретно: это период решений, период денег, период отношений, период одиночества и переосмысления — и почему именно так.
-2. *Что принесёт период* — конкретно по сферам: работа/деньги, отношения, внутреннее состояние. Не "возможны изменения" — а что реально может произойти, на что обратить внимание.
-3. *Главный вызов* — что будет давить, мешать, требовать решения. Конкретная ситуация или паттерн.
-4. *Что использовать* — какая сила сейчас на стороне человека, через каких богов.
-5. *Один практический совет* — не абстрактный, а конкретное действие или наблюдение на этот период.
+6. **Действие.** Один проверяемый шаг на этот период. В финале — короткая
+ироническая реплика богов. Это символическая интерпретация, не гарантия события.
 
-Говори через богов — но сразу переводи на язык жизни.
-Никакой воды. Никаких "возможно" и "скорее всего" через каждое предложение — это размывает прогноз.
+ОБЯЗАТЕЛЬНЫЕ ОГРАНИЧЕНИЯ:
+— Не выдумывай транзиты, аспекты, ворота, линии, дома, даты разворота и
+глобальные конфигурации.
+— Не превращай один срез в прогноз на месяц или год.
+— Технический термин допустим только в блоке «Что рассчитано» и сразу с
+человеческим переводом.
+— Не начинай каждый абзац словами «это значит» и не используй «возможно» как
+замену конкретному наблюдению.
 
-ТРАНЗИТЫ СЕЙЧАС:
+ДАННЫЕ СРЕЗОВ:
 {transits_data}"""
 
 async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1043,6 +1641,8 @@ async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
     if query.data == "consent_yes":
         users[uid]["consent"] = True
+        if not isinstance(users[uid].get("trial_start"), datetime):
+            users[uid]["trial_start"] = datetime.now()
         await query.message.reply_text(
             "Добро пожаловать! Боги ждали тебя, изголодались и хотели бы с тобой познакомиться "
             "до момента, когда Хаос перевернёт твою следующую страницу жизни.\n\n"
@@ -1064,7 +1664,12 @@ async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as exc:
+        # Нажатая ранее кнопка может прислать устаревший callback-query;
+        # это не должно ломать сам переход.
+        print(f"WARN callback answer: {exc}")
     uid = query.from_user.id
 
     # Кнопки которые работают без активной сессии
@@ -1079,6 +1684,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+    if TRIAL_ENFORCED and query.data not in {"back_to_menu", "free_chat"}:
+        _, _, expired = trial_status(uid)
+        if expired:
+            await query.message.reply_text(trial_blocked_message(uid))
+            return CHAT
+
     if query.data == "full_reading":
         await query.message.reply_text(
             "Алёна Данилкина — пиарщик и креативный продюсер с 20-летним опытом в кросс-индустриальных проектах. "
@@ -1090,8 +1701,117 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "back_to_menu":
+        if uid in users:
+            users[uid]["brand_ai_chat"] = False
         await query.message.reply_text("Боги приглашают тебя исследовать свой пантеон. С чего начнём?", reply_markup=MENU_KEYBOARD)
         return
+
+    if query.data == "brand_menu":
+        existing = users[uid].get("brand_data", {})
+        if existing.get("brand_name"):
+            await query.message.reply_text(
+                f"Твой брендовый компас уже собран для «{existing['brand_name']}».\n\n"
+                "Можно обновить диагностику или получить контентную неделю.",
+                reply_markup=BRAND_KEYBOARD,
+            )
+        else:
+            await query.message.reply_text(
+                "Здесь мы собираем тебя и твои продукты из хаоса в ясную систему. "
+                "Бот поможет выделить ключевые компетенции, сформулировать «Я умею…», "
+                "собрать позиционирование и понять, как о себе говорить.",
+                reply_markup=BRAND_KEYBOARD,
+            )
+        return CHAT
+
+    if query.data == "brand_start":
+        await start_brand_flow(query.message, uid)
+        return CHAT
+
+    if query.data == "brand_passport":
+        brand_data = users[uid].get("brand_data", {})
+        if not brand_data.get("brand_name") or not brand_data.get("archetypes"):
+            await query.message.reply_text("Сначала пройди короткую диагностику бренда.", reply_markup=BRAND_KEYBOARD)
+            return CHAT
+        try:
+            await query.message.reply_text("Открываю брендовый паспорт...")
+            reply = await generate_brand_passport(uid)
+            await safe_send(query.message, reply)
+            await query.message.reply_text("Что сделать с брендом дальше?", reply_markup=BRAND_KEYBOARD)
+        except Exception as exc:
+            print(f"ERROR brand passport: {exc}")
+            await query.message.reply_text("Не удалось открыть брендовый паспорт. Попробуй ещё раз.")
+        return CHAT
+
+    if query.data.startswith("brand_answer:"):
+        try:
+            _, index_text, answer = query.data.split(":", 2)
+            question_index = int(index_text)
+            flow = users[uid].get("brand_flow", {})
+            if flow.get("stage") != "quiz" or question_index != int(flow.get("question_index", -1)):
+                await query.message.reply_text("Этот вопрос уже устарел. Начни диагностику заново.")
+                return CHAT
+            flow.setdefault("answers", []).append(answer)
+            next_index = question_index + 1
+            if next_index < len(BRAND_QUESTIONS):
+                flow["question_index"] = next_index
+                users[uid]["brand_flow"] = flow
+                question = BRAND_QUESTIONS[next_index]
+                await query.message.reply_text(question["text"], reply_markup=brand_question_keyboard(next_index))
+                return CHAT
+
+            ranked = score_brand_archetypes(flow["answers"])
+            brand_data = users[uid].setdefault("brand_data", {})
+            brand_data["answers"] = flow["answers"]
+            brand_data["archetypes"] = ranked
+            brand_data["updated_at"] = datetime.now().isoformat()
+            users[uid]["brand_data"] = brand_data
+            users[uid].pop("brand_flow", None)
+            db_save_brand(uid, brand_data)
+
+            await query.message.reply_text("Архетипическая гипотеза собрана. Теперь перевожу её в позиционирование и продвижение...")
+            reply = await generate_brand_passport(uid)
+            await safe_send(query.message, reply)
+            await query.message.reply_text("Что сделать с брендом дальше?", reply_markup=BRAND_KEYBOARD)
+        except Exception as exc:
+            print(f"ERROR brand answer: {exc}")
+            await query.message.reply_text("Не удалось собрать брендовый компас. Попробуй начать диагностику ещё раз.")
+        return CHAT
+
+    if query.data == "brand_content":
+        brand_data = users[uid].get("brand_data", {})
+        if not brand_data.get("brand_name") or not brand_data.get("archetypes"):
+            await query.message.reply_text("Сначала пройди короткую диагностику бренда.", reply_markup=BRAND_KEYBOARD)
+            return CHAT
+        try:
+            await query.message.reply_text("Собираю неделю контента под твою стратегию...")
+            reply = await generate_brand_content(uid)
+            await safe_send(query.message, reply)
+            await query.message.reply_text("Ещё один шаг для бренда?", reply_markup=BRAND_KEYBOARD)
+        except Exception as exc:
+            print(f"ERROR brand content: {exc}")
+            await query.message.reply_text("Не удалось собрать контентную неделю. Попробуй ещё раз через минуту.")
+        return CHAT
+
+    if query.data == "brand_ai_chat":
+        if not has_premium_access(uid):
+            await query.message.reply_text(
+                "💬 Мой ИИ-редактор — это PRO-режим.\n\n"
+                "Он хранит контекст твоего бренда и помогает в течение месяца: "
+                "упаковывает продукты, редактирует тексты, собирает контент и помогает принимать решения.\n\n"
+                "Для подключения напиши Алёне: @danilkina.",
+                reply_markup=BRAND_KEYBOARD,
+            )
+            return CHAT
+        if not users[uid].get("brand_data", {}).get("brand_name"):
+            await query.message.reply_text("Сначала собери базовый профиль бренда.", reply_markup=BRAND_KEYBOARD)
+            return CHAT
+        users[uid]["brand_ai_chat"] = True
+        await query.message.reply_text(
+            "ИИ-редактор подключён. Напиши, что нужно решить: упаковать продукт, "
+            "сформулировать оффер, отредактировать текст или собрать контент.\n\n"
+            "Чтобы выйти, нажми «В главное меню»."
+        )
+        return CHAT
 
     if query.data == "compat_start":
         if uid not in users or not users[uid].get("chart"):
@@ -1132,17 +1852,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("forecast_"):
         birth = users[uid].get("birth", {})
         today = datetime.now()
-        try:
-            transits_raw = await call_mcp_async("transits", {
-                "birth_year": birth["year"], "birth_month": birth["month"],
-                "birth_day": birth["day"], "birth_hour": birth["hour"],
-                "birth_timezone": birth["utc_offset"],
-                "lat": birth["lat"], "lon": birth["lon"],
-                "transit_year": today.year, "transit_month": today.month, "transit_day": today.day,
-            })
-            transits_str = transits_raw.get("raw", str(transits_raw))
-        except Exception as e:
-            transits_str = f"(транзиты недоступны: {e})"
+        transits_str = await collect_transit_snapshots(query.data, birth, today)
 
         extra_str = ""
         if query.data == "forecast_year":
@@ -1185,10 +1895,15 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 extra_str += f"\n(лунар недоступен: {e})"
 
         name = users[uid].get("name", "")
-        prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
-        await query.message.reply_text("Смотрю что происходит на небе...")
-        reply = await ask_ai(uid, prompt)
-        await send_ai_reply(query.message, reply)
+        prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
+        try:
+            await query.message.reply_text("Смотрю что происходит на небе...")
+            reply = await ask_claude(uid, prompt)
+            await safe_send(query.message, reply)
+        except Exception as exc:
+            print(f"ERROR forecast: {exc}")
+            await query.message.reply_text("Не удалось получить прогноз сейчас. Попробуй ещё раз через минуту.")
+            return CHAT
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
         return CHAT
 
@@ -1197,13 +1912,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return CHAT
 
     name = users[uid].get("name", "")
-    db_add_block(uid, query.data)
-    # обновляем в памяти чтобы следующий блок знал что уже разобрано
-    if "blocks_seen" not in users[uid]:
-        users[uid]["blocks_seen"] = []
-    if query.data not in users[uid]["blocks_seen"]:
-        users[uid]["blocks_seen"].append(query.data)
-    full_prompt = f"Имя: {name}. Обращайся на 'ты', женский род.\n\n{prompt}"
+    full_prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{prompt}"
 
     # Для блока призвания добавляем контекст Креста воплощения
     if query.data == "block_mission" and uid in users:
@@ -1212,14 +1921,6 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cross_ctx = get_cross_context(hd)
             if cross_ctx:
                 full_prompt += f"\n\nКРЕСТ ВОПЛОЩЕНИЯ (описания из HD библиотеки):\n{cross_ctx}"
-
-    # Для блока ресурсов добавляем PHS переменные
-    if query.data == "block_resources" and uid in users:
-        hd = users[uid].get("hd", {})
-        if hd:
-            phs_ctx = get_phs_context(hd)
-            if phs_ctx:
-                full_prompt += f"\n\nPHS ПЕРЕМЕННЫЕ (из книг Ra Uru Hu):\n{phs_ctx}"
 
     # Для блока отношений добавляем ворота любви из Love Book
     if query.data == "block_love" and uid in users:
@@ -1231,8 +1932,15 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.message.reply_text("Смотрю в карту...")
-        reply = await ask_ai(uid, full_prompt)
-        await send_ai_reply(query.message, reply)
+        reply = await ask_claude(uid, full_prompt)
+        await safe_send(query.message, reply)
+        # Помечаем тему только после успешного ответа. Иначе текущий блок
+        # попадал в «уже разобрано» ещё до чтения и модель сама себя просила
+        # его не повторять.
+        db_add_block(uid, query.data)
+        users[uid].setdefault("blocks_seen", [])
+        if query.data not in users[uid]["blocks_seen"]:
+            users[uid]["blocks_seen"].append(query.data)
     except Exception as e:
         import traceback
         print(f"ERROR in handle_button: {traceback.format_exc()}")
@@ -1256,8 +1964,8 @@ async def restore_session(uid: int, msg_obj) -> bool:
     try:
         # Нужны координаты — загрузим из города
         birth = users[uid]["birth"]
-        if "lat" not in birth:
-            coords = parse_city(birth.get("city", ""))
+        if birth.get("lat") is None or birth.get("lon") is None or birth.get("utc_offset") is None:
+            coords = parse_city(birth.get("city", ""), birth)
             if coords:
                 birth["lat"], birth["lon"], birth["utc_offset"] = coords
         natal, hd = await calculate_chart(birth)
@@ -1277,11 +1985,37 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text.strip()
 
+    if TRIAL_ENFORCED and not user_text.lower() in {"/start", "/reset", "сначала", "заново"}:
+        _, _, expired = trial_status(uid)
+        if expired:
+            await update.message.reply_text(trial_blocked_message(uid))
+            return CHAT
+
     # Команды
     if user_text.lower() in ["/reset", "сначала", "заново"]:
-        users[uid] = {"history": [], "trial_start": datetime.now()}
+        trial_start = users[uid].get("trial_start", datetime.now())
+        users[uid] = {
+            "history": [],
+            "trial_start": trial_start,
+            "brand_data": users[uid].get("brand_data", {}),
+        }
         await update.message.reply_text("Начнём заново. Как тебя зовут?")
         return ASK_NAME
+
+    if users[uid].get("brand_ai_chat"):
+        try:
+            reply = await ask_claude(uid, build_brand_chat_prompt(uid, user_text))
+            await safe_send(update.message, reply)
+            await update.message.reply_text("Продолжить работу с брендом?", reply_markup=BRAND_KEYBOARD)
+        except Exception as exc:
+            print(f"ERROR brand ai chat: {exc}")
+            await update.message.reply_text("ИИ-редактор не смог ответить. Попробуй сформулировать задачу ещё раз.")
+        return CHAT
+
+    if users[uid].get("brand_flow", {}).get("stage") in {"name", "experience", "offer", "audience", "goal"}:
+        handled = await handle_brand_text(update, uid)
+        if handled:
+            return CHAT
 
     # Обработка флоу совместимости
     if users[uid].get("compat_flow"):
@@ -1318,7 +2052,7 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Город рождения — например: «Москва, Россия»")
             return CHAT
         elif "lat" not in compat.get("birth", {}):
-            coords = parse_city(user_text)
+            coords = parse_city(user_text, compat.get("birth"))
             if not coords:
                 await update.message.reply_text(f"Не нашёл «{user_text}». Попробуй по-другому.")
                 return CHAT
@@ -1329,38 +2063,8 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             await update.message.reply_text("Считаю карты. Боги знакомятся...")
             try:
-                natal2, hd2 = await calculate_chart(compat["birth"])
-                name1 = users[uid].get("name", "")
-                name2 = compat["name"]
-                rel_type = compat.get("type", "отношения")
-                chart1 = users[uid].get("chart", {}).get("raw", "")
-                hd1_str = users[uid].get("hd", {}).get("raw", "")
-                chart2 = natal2.get("raw", "")
-                hd2_str = hd2.get("raw", "")
-                no_time = compat.get("no_time", False)
-                time_note = " (время рождения неизвестно)" if no_time else ""
-
-                prompt = f"""Сделай разбор совместимости для: {rel_type}.
-{name1} и {name2}{time_note}.
-
-Когда карты Дизайна Человека накладываются — смотри какие каналы активируются между ними (один человек имеет один конец канала, другой — другой). Это электромагнитное притяжение. Также смотри где оба определены одинаково — там доминирование. Где никто не определён — там уязвимость пары.
-
-КАРТА {name1}: {chart1}
-HD {name1}: {hd1_str}
-КАРТА {name2}: {chart2}
-HD {name2}: {hd2_str}
-
-Структура разбора для типа «{rel_type}»:
-1. Главная динамика — что происходит между ними по природе
-2. Астро-совместимость — где боги одного резонируют с богами другого, где конфликт
-3. HD-совместимость — какие каналы активируются между ними, что это даёт паре, где напряжение
-4. Главный вызов этих отношений
-5. Главная сила этой пары — в чём они сильны вместе
-
-Обращайся к {name1} на "ты". Конкретно, без воды, без терминов."""
-
-                reply = await ask_ai(uid, prompt)
-                await send_ai_reply(update.message, reply)
+                reply = await generate_compatibility_reply(uid, compat)
+                await safe_send(update.message, reply)
                 await update.message.reply_text("Выбери следующую тему:", reply_markup=MENU_KEYBOARD)
                 users[uid]["menu_shown"] = True
             except Exception as e:
@@ -1368,8 +2072,13 @@ HD {name2}: {hd2_str}
                 await update.message.reply_text("Упс... Посейдон разлил воду. Попробуй ещё раз.")
             return CHAT
 
-    reply = await ask_ai(uid, user_text)
-    await send_ai_reply(update.message, reply)
+    try:
+        reply = await ask_claude(uid, user_text)
+        await safe_send(update.message, reply)
+    except Exception as exc:
+        print(f"ERROR chat: {exc}")
+        await update.message.reply_text("Аполлон потерял связь с архивом. Попробуй ещё раз через минуту.")
+        return CHAT
 
     # Показываем меню только если это первый раз (menu_shown не установлен)
     if not users[uid].get("menu_shown"):
@@ -1419,7 +2128,7 @@ async def compat_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def compat_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     city = update.message.text.strip()
-    coords = parse_city(city)
+    coords = parse_city(city, users[uid].get("compat", {}).get("birth"))
     if not coords:
         await update.message.reply_text(f"Не нашёл «{city}». Попробуй написать по-другому.")
         return COMPAT_PLACE
@@ -1432,43 +2141,11 @@ async def compat_place(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Считаю карты. Боги знакомятся...")
 
     try:
-        natal2, hd2 = calculate_chart(b)
-        name1 = users[uid].get("name", "")
-        name2 = users[uid]["compat"]["name"]
-        chart1 = users[uid].get("chart", {}).get("raw", "")
-        hd1 = users[uid].get("hd", {}).get("raw", "")
-        chart2 = natal2.get("raw", "")
-        hd2_str = hd2.get("raw", "")
-        no_time = users[uid]["compat"].get("no_time", False)
-        time_note = " (время рождения неизвестно — Асцендент приблизительный)" if no_time else ""
-
-        prompt = f"""Сделай разбор совместимости двух людей через пантеон богов и Дизайн Человека.
-
-{name1} и {name2}{time_note}.
-
-КАРТА {name1} (астрология):
-{chart1}
-
-HD {name1}:
-{hd1}
-
-КАРТА {name2} (астрология):
-{chart2}
-
-HD {name2}:
-{hd2_str}
-
-Структура разбора:
-1. *Как их пантеоны взаимодействуют* — какие боги одного резонируют с богами другого, где союз, где конфликт
-2. *Главная динамика пары* — что между ними происходит по природе: притяжение, напряжение, взаимодополнение
-3. *По HD* — как их типы и стратегии взаимодействуют. Где они естественно дополняют друг друга, где могут столкнуться
-4. *Главный вызов* — что будет сложнее всего в этих отношениях и почему
-5. *Главный ресурс* — что делает эту пару сильной, в чём их сила вместе
-
-Обращайся к {name1} на "ты". Говори конкретно, без воды. Никаких терминов без перевода на человеческий язык."""
-
-        reply = await ask_ai(uid, prompt)
-        await send_ai_reply(update.message, reply)
+        # Здесь используется тот же единый расчёт, что и в основном CHAT-флоу.
+        # Раньше этот обработчик строил второй, более слабый промпт и мог давать
+        # другой результат в зависимости от того, как пользователь вошёл в меню.
+        reply = await generate_compatibility_reply(uid, users[uid]["compat"])
+        await safe_send(update.message, reply)
         await update.message.reply_text("Что ещё исследуем у богов?", reply_markup=MENU_KEYBOARD)
         users[uid]["menu_shown"] = True
         return CHAT
@@ -1490,8 +2167,9 @@ def main():
         print("❌ Нужен TELEGRAM_TOKEN в переменных окружения")
         print("   export TELEGRAM_TOKEN='ваш_токен'")
         return
-    if not any((OPENAI_API_KEY, ANTHROPIC_API_KEY, compatible_client)):
-        print("❌ Нужен хотя бы один AI API ключ: OPENAI_API_KEY, ANTHROPIC_API_KEY или COMPATIBLE_API_KEY")
+    if not ANTHROPIC_API_KEY:
+        print("❌ Нужен ANTHROPIC_API_KEY в переменных окружения")
+        print("   export ANTHROPIC_API_KEY='ваш_ключ'")
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1525,7 +2203,6 @@ def main():
             hc.BOT_TOKEN     = TELEGRAM_TOKEN
             hc.ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")
             hc.ANTHROPIC_KEY = ANTHROPIC_API_KEY
-            hc.OPENAI_KEY    = OPENAI_API_KEY
             if not hc.ALERT_CHAT_ID:
                 return  # некуда слать — молчим
             results = []
@@ -1568,25 +2245,8 @@ def main():
     else:
         print("⚠️ job_queue недоступен — установи python-telegram-bot[job-queue]")
 
-    webhook_base_url = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
-    if not webhook_base_url and os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
-        webhook_base_url = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
-    if webhook_base_url:
-        # Webhook eliminates competing getUpdates requests. The URL path is
-        # derived from the bot token without exposing the token itself.
-        webhook_path = "telegram/" + hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()
-        print("🤖 Бот запущен в webhook-режиме.")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get("PORT", "8080")),
-            url_path=webhook_path,
-            webhook_url=f"{webhook_base_url}/{webhook_path}",
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-    else:
-        print("🤖 Бот запущен в polling-режиме. Ctrl+C для остановки.")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 Бот запущен. Ctrl+C для остановки.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
