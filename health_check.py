@@ -34,14 +34,19 @@ async def send_alert(text: str, is_ok: bool = False):
         return
     emoji = "✅" if is_ok else "🚨"
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": ALERT_CHAT_ID,
-        "text": f"{emoji} *Аполлон health-check* [{datetime.now().strftime('%H:%M %d.%m')}]\n\n{text}",
-        "parse_mode": "Markdown",
-    }
+    body = f"{emoji} *Аполлон health-check* [{datetime.now().strftime('%H:%M %d.%m')}]\n\n{text}"
+    chunks = [body[i:i + 3500] for i in range(0, len(body), 3500)] or [body]
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=payload)
+            for chunk in chunks:
+                response = await client.post("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage", json={
+                    "chat_id": ALERT_CHAT_ID, "text": chunk, "parse_mode": "Markdown"
+                })
+                if response.status_code >= 400:
+                    # Ошибка Markdown не должна скрывать сам health-check.
+                    await client.post("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage", json={
+                        "chat_id": ALERT_CHAT_ID, "text": chunk
+                    })
     except Exception as e:
         print(f"Не удалось отправить алерт: {e}")
 
@@ -52,7 +57,8 @@ async def check_imports() -> tuple[bool, str]:
     """Проверяет что все модули импортируются без ошибок."""
     try:
         import anthropic
-        import pyswisseph
+        # Пакет называется pyswisseph, но импортируется модулем swisseph.
+        import swisseph
         from hd_library import (
             get_hd_context, get_cross_context,
             get_love_context, get_phs_context, get_profile_context
@@ -108,9 +114,9 @@ async def check_mcp_server() -> tuple[bool, str]:
 
         # Минимальная проверка — natal_chart с тестовыми данными
         args = {
-            "birth_year": 1990, "birth_month": 6, "birth_day": 15,
-            "birth_hour": 12, "birth_minute": 0,
-            "birth_timezone": 3.0, "lat": 55.75, "lon": 37.61
+            "year": 1990, "month": 6, "day": 15,
+            "hour": 12, "minute": 0,
+            "timezone": 3.0, "lat": 55.75, "lon": 37.61
         }
         result = await asyncio.wait_for(
             asyncio.to_thread(mcp_server.tool_natal_chart, args),
@@ -134,9 +140,9 @@ async def check_human_design() -> tuple[bool, str]:
         import server as mcp_server
 
         args = {
-            "birth_year": 1990, "birth_month": 6, "birth_day": 15,
-            "birth_hour": 12, "birth_minute": 0,
-            "birth_timezone": 3.0
+            "year": 1990, "month": 6, "day": 15,
+            "hour": 12, "minute": 0,
+            "timezone": 3.0
         }
         result = await asyncio.wait_for(
             asyncio.to_thread(mcp_server.tool_human_design, args),
@@ -154,6 +160,35 @@ async def check_human_design() -> tuple[bool, str]:
         return False, "HD карта: timeout 15s"
     except Exception as e:
         return False, f"HD карта: {traceback.format_exc()[-300:]}"
+
+
+async def check_hd_compatibility() -> tuple[bool, str]:
+    """Проверяет, что составной connection chart действительно считается."""
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import server as mcp_server
+
+        params_a = {"year": 1981, "month": 2, "day": 23, "hour": 9,
+                    "minute": 50, "timezone": 1.0, "lat": 52.43, "lon": 15.12}
+        params_b = {"year": 1985, "month": 7, "day": 15, "hour": 14,
+                    "minute": 30, "timezone": 3.0, "lat": 55.75, "lon": 37.58}
+        hd_a, hd_b = await asyncio.wait_for(asyncio.gather(
+            asyncio.to_thread(mcp_server.tool_human_design, params_a),
+            asyncio.to_thread(mcp_server.tool_human_design, params_b),
+        ), timeout=20)
+        raw_a = hd_a.get("raw", "") if isinstance(hd_a, dict) else str(hd_a)
+        raw_b = hd_b.get("raw", "") if isinstance(hd_b, dict) else str(hd_b)
+        composite = mcp_server.build_hd_compatibility(raw_a, raw_b, "A", "B")
+        required = ["СОСТАВНАЯ КАРТА", "ЭЛЕКТРОМАГНИТНЫЕ СОЕДИНЕНИЯ",
+                    "КОМПРОМИССЫ", "ОПРЕДЕЛЁННЫЕ ЦЕНТРЫ"]
+        missing = [marker for marker in required if marker not in composite]
+        if missing:
+            return False, f"Составная HD-карта неполная, нет: {missing}"
+        return True, "Составная HD-карта OK (каналы, связи и центры рассчитаны)"
+    except asyncio.TimeoutError:
+        return False, "Составная HD-карта: timeout 20s"
+    except Exception as e:
+        return False, f"Составная HD-карта: {traceback.format_exc()[-300:]}"
 
 
 async def check_claude_api() -> tuple[bool, str]:
@@ -201,13 +236,15 @@ async def check_bot_prompts() -> tuple[bool, str]:
         # Проверяем BLOCK_PROMPTS через grep
         expected_blocks = [
             "block_identity", "block_mission", "block_love",
-            "block_money", "block_health", "block_resources"
+            "block_money", "block_health", "block_resources",
         ]
         missing = [b for b in expected_blocks if f'"{b}"' not in bot_code]
+        brand_markers = ["BRAND_ARCHETYPES", "BRAND_QUESTIONS", "brand_content"]
+        missing += [b for b in brand_markers if b not in bot_code]
         if missing:
             return False, f"BLOCK_PROMPTS: нет блоков {missing}"
 
-        return True, f"bot.py синтаксис OK, все {len(expected_blocks)} блоков на месте"
+        return True, f"bot.py синтаксис OK, личные блоки и брендовый компас на месте"
 
     except SyntaxError as e:
         return False, f"bot.py синтаксическая ошибка: {e}"
@@ -249,6 +286,7 @@ CHECKS = [
     ("БД (SQLite)",    check_db),
     ("MCP сервер",     check_mcp_server),
     ("HD карта",       check_human_design),
+    ("HD совместимость", check_hd_compatibility),
     ("Claude API",     check_claude_api),
 ]
 

@@ -10,6 +10,19 @@ from functools import lru_cache
 
 LIB_DIR = Path(__file__).parent
 
+
+def _clean_library_excerpt(value: str, limit: int = 600) -> str:
+    """Убирает OCR-колонтитулы и служебные страницы из короткой выдержки."""
+    if not value:
+        return ''
+    cleaned = re.sub(r'===\s*стр\.?\s*\d+\s*===', ' ', value, flags=re.IGNORECASE)
+    cleaned = re.sub(r'Данный перевод не является официальным\..*?запрещены[»\"\.]?', ' ', cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'Страница\s*[\u00a0 ]*\d+', ' ', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\n\s*[-—]?\s*\.{3,}\s*\n', '\n', cleaned)
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()[:limit]
+
 # ─── ЗАГРУЗКА ФАЙЛОВ ─────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
@@ -29,27 +42,37 @@ def _build_gates_index() -> dict:
 
     # Находим каждую гексаграмму
     gate_pattern = re.compile(r'Гексаграмма\s+(\d+)[^\n]*\n', re.IGNORECASE)
+    # В файле есть оглавление и несколько повторных заголовков страниц. Берём
+    # последнее вхождение каждых ворот — это основной текст, а не оглавление.
     gate_matches = list(gate_pattern.finditer(text))
+    latest = {}
+    for match in gate_matches:
+        latest[int(match.group(1))] = match
+    selected = sorted(latest.values(), key=lambda match: match.start())
 
-    for i, match in enumerate(gate_matches):
+    for i, match in enumerate(selected):
         gate_num = int(match.group(1))
         start = match.start()
-        end = gate_matches[i+1].start() if i+1 < len(gate_matches) else len(text)
+        end = selected[i+1].start() if i+1 < len(selected) else len(text)
         gate_text = text[start:end]
 
-        # Разбиваем по линиям (Линия 1, Линия 2, ...)
-        line_pattern = re.compile(r'Линия\s+(\d)', re.IGNORECASE)
+        # В основном тексте заголовки выглядят как «1.1», а не «Линия 1».
+        line_pattern = re.compile(rf'(?m)^\s*{gate_num}\.([1-6])(?:[\.\s]|$)')
         line_matches = list(line_pattern.finditer(gate_text))
 
         lines = {}
         for j, lm in enumerate(line_matches):
             line_num = int(lm.group(1))
+            if line_num in lines:
+                continue
             ls = lm.start()
-            le = line_matches[j+1].start() if j+1 < len(line_matches) else len(gate_text)
-            lines[line_num] = gate_text[ls:le].strip()[:600]
+            # Берём до следующего уникального заголовка линии.
+            next_line = next((n for n in line_matches[j+1:] if int(n.group(1)) not in lines), None)
+            le = next_line.start() if next_line else len(gate_text)
+            lines[line_num] = _clean_library_excerpt(gate_text[ls:le], 600)
 
         index[gate_num] = {
-            'full': gate_text[:300].strip(),
+            'full': _clean_library_excerpt(gate_text[:300], 300),
             'lines': lines
         }
 
@@ -70,7 +93,15 @@ def _build_channels_index() -> dict:
         parts = nums.split('-')
         if len(parts) == 2:
             key = (int(parts[0]), int(parts[1]))
-            index[key] = f"Канал {nums} — {name}: {desc}"
+            candidate = f"Канал {nums} — {name}: {desc}"
+            # В локальном конспекте некоторые каналы встречаются повторно:
+            # поздняя запись иногда содержит только «см. выше». Сохраняем
+            # наиболее полное описание, а не последнее попавшееся.
+            previous = index.get(key, '')
+            placeholder = not desc or 'см. выше' in desc.lower() or len(desc) < 80
+            previous_placeholder = not previous or 'см. выше' in previous.lower() or len(previous) < 120
+            if not previous or (not placeholder and (previous_placeholder or len(candidate) > len(previous))):
+                index[key] = candidate
     return index
 
 
@@ -160,88 +191,121 @@ MOT_NAMES = {1:"Страх (Fear)", 2:"Надежда (Hope)", 3:"Желание
 COG_NAMES = {1:"Выживание (Survival)", 2:"Жертва (Sacrifice)", 3:"Фантазия (Fantasy)",
              4:"Вероятность (Probability)", 5:"Эмпатия (Empathy)", 6:"Солидарность (Solidarity)"}
 
+# Связка ворот с центрами нужна для чтения по цепочке
+# «планета → ворота → линия → центр → канал/контур». Она дублирует только
+# канонический список расчёта из server.py, чтобы библиотека не импортировала
+# исполняемый MCP-сервер и не создавала циклическую зависимость.
+GATE_TO_CENTER = {}
+for _center_name, _center_gates in {
+    "Голова": [64, 61, 63],
+    "Аджна": [47, 24, 4, 17, 43, 11],
+    "Горло": [62, 23, 56, 35, 45, 12, 33, 8, 20, 31, 16],
+    "Я/Самость": [1, 2, 10, 13, 15, 25, 46, 7],
+    "Эго": [21, 40, 26, 51],
+    "Сакральный": [5, 14, 29, 59, 9, 3, 42, 27, 34],
+    "Селезёнка": [48, 57, 32, 28, 18, 50, 44],
+    "Солнечное сплетение": [6, 37, 22, 36, 30, 55, 49],
+    "Корень": [53, 60, 52, 58, 38, 54, 19, 41, 39],
+}.items():
+    for _gate_num in _center_gates:
+        GATE_TO_CENTER[_gate_num] = _center_name
+
 
 def get_phs_context(hd_data: dict) -> str:
-    """
-    По карте HD вычисляет 4 переменных и возвращает их описания из PHS книг.
+    """Возвращает отдельный слой переменных, не смешивая его с линиями.
 
-    Переменные:
-      Детерминация = линия Сознательного Солнца (Personality Sun)
-      Среда        = линия Дизайнного Северного Узла (Design North Node)
-      Мотивация    = линия Сознательной Земли (Personality Earth)
-      Когниция     = линия Дизайнной Земли (Design Earth)
+    В карте используются вложенные уровни Gate.Line.Color.Tone.Base.
+    Determination берётся с дизайнной стороны Солнца/Земли, Environment — с
+    дизайнных узлов, View — с личностных узлов, Motivation — с личностного
+    Солнца. Линия остаётся самостоятельным уровнем и читается через Line
+    Companion в ``get_hd_context``.
     """
     raw = hd_data.get('raw', '')
     if not raw:
         return ''
 
-    phs = _build_phs_index()
-    if not phs:
-        return ''
+    conscious = re.search(r'СОЗНАТЕЛЬНЫЕ ВОРОТА.*?(?=БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+    design = re.search(r'БЕССОЗНАТЕЛЬНЫЕ ВОРОТА.*', raw, re.DOTALL)
+    conscious_text = conscious.group(0) if conscious else ''
+    design_text = design.group(0) if design else ''
 
-    # Парсим нужные 4 линии
-    def get_line(section_text, planet):
-        m = re.search(rf'{planet}\s+Ворота\s+\d+\.(\d+)', section_text)
-        return int(m.group(1)) if m else None
+    def find_detail(section: str, planet: str):
+        pattern = (
+            rf'^\s*{re.escape(planet)}\s+Ворота\s+'
+            r'(\d+)\.(\d+)\.(\d+)\.(\d+)\.(\d+)'
+        )
+        match = re.search(pattern, section, re.MULTILINE)
+        if not match:
+            return None
+        gate, line, color, tone, base = map(int, match.groups())
+        return {'gate': gate, 'line': line, 'color': color, 'tone': tone, 'base': base}
 
-    con_section = re.search(r'СОЗНАТЕЛЬНЫЕ ВОРОТА.*?(?=БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
-    unc_section = re.search(r'БЕССОЗНАТЕЛЬНЫЕ ВОРОТА.*', raw, re.DOTALL)
+    phs_index = _build_phs_index()
 
-    con_text = con_section.group() if con_section else ''
-    unc_text = unc_section.group() if unc_section else ''
+    def describe(detail, label, names, source_excerpt=''):
+        if not detail:
+            return f"{label}: нет полного расчёта"
+        color = detail['color']
+        name = names.get(color, f"цвет {color}")
+        result = (
+            f"{label}: {detail['gate']}.{detail['line']}.{color}.{detail['tone']}.{detail['base']} "
+            f"— {name}; тон {detail['tone']}, база {detail['base']}"
+        )
+        if source_excerpt:
+            result += f"\n  Справочный тезис: {_clean_library_excerpt(source_excerpt, 260)}"
+        else:
+            result += (
+                "\n  Локального проверенного тезисного фрагмента для этого слоя пока нет; "
+                "не достраивать механику по общим словам."
+            )
+        return result
 
-    det_line = get_line(con_text, 'Солнце')    # Personality Sun → Детерминация
-    env_line = get_line(unc_text, 'С\\.Узел')  # Design North Node → Среда
-    mot_line = get_line(con_text, 'Земля')     # Personality Earth → Мотивация
-    cog_line = get_line(unc_text, 'Земля')     # Design Earth → Когниция
+    # Названия цветовых слоёв из локальной библиотеки; они не заменяют
+    # индивидуальное чтение тона и базы.
+    det_names = {1: 'последовательность', 2: 'вкус', 3: 'открытость/жажда',
+                 4: 'прикосновение', 5: 'звук', 6: 'свет'}
+    env_names = {1: 'пещеры', 2: 'рынки', 3: 'кухни', 4: 'горы', 5: 'долины', 6: 'берега'}
+    view_names = {1: 'выживание', 2: 'возможность', 3: 'власть',
+                  4: 'желание', 5: 'вероятность', 6: 'личное'}
+    motivation_names = {1: 'страх', 2: 'надежда', 3: 'желание',
+                        4: 'потребность', 5: 'вина', 6: 'невинность'}
 
-    sections = []
+    sections = ["=== ПЕРЕМЕННЫЕ: отдельный слой от линий ==="]
+    design_sun = find_detail(design_text, 'Солнце')
+    design_earth = find_detail(design_text, 'Земля')
+    design_node = find_detail(design_text, 'С.Узел')
+    design_south_node = find_detail(design_text, 'Ю.Узел')
+    personality_node = find_detail(conscious_text, 'С.Узел')
+    personality_south_node = find_detail(conscious_text, 'Ю.Узел')
+    personality_sun = find_detail(conscious_text, 'Солнце')
+    personality_earth = find_detail(conscious_text, 'Земля')
 
-    # Детерминация (питание/тело)
-    if det_line:
-        side = "Left (Активный)" if det_line <= 3 else "Right (Пассивный)"
-        name = DET_NAMES.get(det_line, f"Color {det_line}")
-        desc = phs['det'].get(det_line, '')
-        sections.append(
-            f"=== ДЕТЕРМИНАЦИЯ: {name} [{side}] ===\n"
-            f"Тип питания и работы с телом. Линия Личностного Солнца: {det_line}\n"
-            + (desc[:800] if desc else "")
+    def paired(detail, label):
+        if not detail:
+            return ''
+        return (
+            f"\n  Парная точка {label}: "
+            f"{detail['gate']}.{detail['line']}.{detail['color']}.{detail['tone']}.{detail['base']}"
         )
 
-    # Среда (окружение)
-    if env_line:
-        side = "Active (движение)" if env_line <= 3 else "Passive (постоянство)"
-        name = ENV_NAMES.get(env_line, f"Color {env_line}")
-        desc = phs['env'].get(env_line, '')
-        sections.append(
-            f"=== СРЕДА: {name} [{side}] ===\n"
-            f"Оптимальная среда для здоровья и эффективности. Линия Дизайнного Узла: {env_line}\n"
-            + (desc[:800] if desc else "")
-        )
-
-    # Мотивация
-    if mot_line:
-        side = "Left" if mot_line <= 3 else "Right"
-        name = MOT_NAMES.get(mot_line, f"Мотивация {mot_line}")
-        desc = phs['mot'].get(mot_line, '')
-        sections.append(
-            f"=== МОТИВАЦИЯ: {name} [{side}] ===\n"
-            f"Что движет изнутри. Линия Личностной Земли: {mot_line}\n"
-            + (desc if desc else "")
-        )
-
-    # Когниция
-    if cog_line:
-        side = "Left" if cog_line <= 3 else "Right"
-        name = COG_NAMES.get(cog_line, f"Когниция {cog_line}")
-        desc = phs['cog'].get(cog_line, '')
-        sections.append(
-            f"=== КОГНИЦИЯ: {name} [{side}] ===\n"
-            f"Как воспринимает и обрабатывает мир. Линия Дизайнной Земли: {cog_line}\n"
-            + (desc if desc else "")
-        )
-
-    return '\n\n'.join(sections)
+    sections.append(describe(
+        design_sun, 'Тело и питание', det_names,
+        phs_index.get('det', {}).get(design_sun['color'], '') if design_sun else ''
+    ) + paired(design_earth, 'оси тела'))
+    sections.append(describe(
+        design_node, 'Среда', env_names,
+        phs_index.get('env', {}).get(design_node['color'], '') if design_node else ''
+    ) + paired(design_south_node, 'узловой оси среды'))
+    sections.append(describe(personality_node, 'Взгляд', view_names) +
+                    paired(personality_south_node, 'узловой оси взгляда'))
+    sections.append(describe(personality_sun, 'Мотивация', motivation_names) +
+                    paired(personality_earth, 'оси мотивации'))
+    sections.append(
+        "Правило чтения: цвет задаёт слой переменной, тон уточняет способ восприятия, "
+        "база пока передаётся как расчётное значение без самостоятельного текста. "
+        "Не смешивать эти значения с линией ворот."
+    )
+    return '\n'.join(sections)
 
 
 # ─── КНИГА ЛЮБВИ ─────────────────────────────────────────────────────────────
@@ -472,7 +536,11 @@ def get_profile_context(hd_data: dict) -> str:
     profile_key = profile_match.group(1)
     data = PROFILE_DESCRIPTIONS.get(profile_key)
     if not data:
-        return f"Профиль {profile_key}"
+        return (
+            f"=== ПРОФИЛЬ {profile_key} ===\n"
+            "Подробного проверенного описания этого профиля нет в локальной библиотеке. "
+            "Не достраивать его по памяти и не выдавать общие формулы за расчёт."
+        )
 
     result = f"=== ПРОФИЛЬ {profile_key} — {data['name']} ===\n"
     result += f"Тема: {data['theme']}\n\n"
@@ -499,17 +567,31 @@ def get_hd_context(hd_data: dict) -> str:
     if not raw:
         return ''
 
-    sections = []
+    sections = [
+        "=== ПРОВЕРКА ИСТОЧНИКОВ HD ===\n"
+        "Расчётные факты взяты из текущей карты. Описания типов и центров — из "
+        "локального справочника с указанным авторством; линии — из рабочего перевода "
+        "Line Companion, подтверждённого пользователем. Технические колонтитулы "
+        "очищаются, а если текст источника не найден, смысл не достраивать."
+    ]
 
     # ── Тип ──
     type_match = re.search(r'ТИП:\s*(.+)', raw)
     if type_match:
         hd_type = type_match.group(1).strip()
         types_idx = _build_types_index()
+        found = False
         for key, val in types_idx.items():
             if 'ТИП' in key and hd_type.lower() in key.lower():
                 sections.append(f"=== ТИП: {hd_type} ===\n{val}")
+                found = True
                 break
+        if not found:
+            sections.append(
+                f"=== ТИП: {hd_type} ===\n"
+                "Проверенного подробного описания этого типа нет в локальной библиотеке. "
+                "Использовать только рассчитанные стратегию и авторитет; не достраивать механику по памяти."
+            )
 
     # ── Авторитет ──
     auth_match = re.search(r'АВТОРИТЕТ:\s*(.+)', raw)
@@ -526,6 +608,12 @@ def get_hd_context(hd_data: dict) -> str:
     if profile_ctx:
         sections.append(profile_ctx)
 
+    # ── Все планеты, ворота и линии ──
+    # Раньше в контекст попадали только Солнце/Луна/Земля и активные каналы.
+    # Из-за этого Меркурий, Венера, Марс и внешние планеты могли теряться, а
+    # модель достраивала их «по общему впечатлению». Теперь каждая активация
+    # передаётся с указанием стороны и выдержкой из Line Companion.
+
     # ── Парсим ворота с планетами (для синтеза) ──
     # Формат: "Солнце       Ворота 55.5   Рыбы 4°39'"
     planet_gate_pattern = re.compile(
@@ -535,6 +623,7 @@ def get_hd_context(hd_data: dict) -> str:
     )
     # Собираем: {gate_num: [(planet, line, is_conscious)]}
     gate_planets = {}
+    gates_idx = _build_gates_index()
     conscious_section = re.search(r'СОЗНАТЕЛЬНЫЕ ВОРОТА.*?:(.*?)(?=БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
     unconscious_section = re.search(r'БЕССОЗНАТЕЛЬНЫЕ ВОРОТА.*?:(.*?)$', raw, re.DOTALL)
 
@@ -550,10 +639,26 @@ def get_hd_context(hd_data: dict) -> str:
                 gate_planets[gate_num] = []
             gate_planets[gate_num].append((planet, line_num, is_conscious))
 
+    planet_line_texts = []
+    for gate_num, planet_list in gate_planets.items():
+        gate_data = gates_idx.get(gate_num, {})
+        for planet, line_num, is_conscious in planet_list:
+            side = "личность" if is_conscious else "дизайн тела"
+            line_text = _clean_library_excerpt(gate_data.get('lines', {}).get(line_num, ''), 420)
+            center_name = GATE_TO_CENTER.get(gate_num, 'центр не найден')
+            item = f"{planet}: ворота {gate_num}.{line_num} ({side}; центр: {center_name})"
+            if line_text:
+                item += f"\n  Описание линии из Line Companion: {line_text}"
+            planet_line_texts.append(item)
+    if planet_line_texts:
+        sections.append(
+            "=== ПЛАНЕТЫ, ВОРОТА И ЛИНИИ (полная карта) ===\n" +
+            "\n\n".join(planet_line_texts)
+        )
+
     # ── Каналы — синтез с планетами и контуром ──
     channels_match = re.search(r'КАНАЛЫ[^\n]*:\n(.*?)(?=СОЗНАТЕЛЬНЫЕ|БЕССОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
     channels_idx = _build_channels_index()
-    gates_idx = _build_gates_index()
     channel_texts = []
 
     if channels_match:
@@ -573,12 +678,17 @@ def get_hd_context(hd_data: dict) -> str:
                             kind = 'сознательные' if is_conscious else 'бессознательные'
                             # Описание линии из Line Companion
                             gate_data = gates_idx.get(gate_num, {})
-                            line_text = gate_data.get('lines', {}).get(line_num, '')[:300]
+                            line_text = _clean_library_excerpt(gate_data.get('lines', {}).get(line_num, ''), 300)
+                            center_name = GATE_TO_CENTER.get(gate_num, 'центр не найден')
                             gate_info_parts.append(
-                                f"  Ворота {gate_num}.{line_num} [{kind}] активирует {planet}:\n  {line_text}"
+                                f"  Ворота {gate_num}.{line_num} [{kind}; центр: {center_name}] "
+                                f"активирует {planet}:\n  {line_text}"
                             )
 
-                channel_block = f"{desc}"
+                channel_block = desc or (
+                    f"Канал {a}-{b}: проверенного описания нет в локальной библиотеке. "
+                    "Учитывать только сам факт рассчитанного канала и не достраивать смысл по памяти."
+                )
                 if gate_info_parts:
                     channel_block += "\n" + "\n".join(gate_info_parts)
                 channel_texts.append(channel_block)
@@ -607,7 +717,7 @@ def get_hd_context(hd_data: dict) -> str:
                 seen.add(gate_num)
                 kind = 'сознательные' if is_conscious else 'бессознательные'
                 gate_data = gates_idx.get(gate_num, {})
-                line_text = gate_data.get('lines', {}).get(line_num, '')[:350]
+                line_text = _clean_library_excerpt(gate_data.get('lines', {}).get(line_num, ''), 350)
                 solo_gate_texts.append(
                     f"Ворота {gate_num}.{line_num} ({planet}, {kind}):\n{line_text}"
                 )
@@ -615,23 +725,35 @@ def get_hd_context(hd_data: dict) -> str:
     if solo_gate_texts:
         sections.append("=== КЛЮЧЕВЫЕ ОДИНОЧНЫЕ ВОРОТА (Солнце/Луна/Земля) ===\n" + '\n\n'.join(solo_gate_texts))
 
-    # ── Открытые центры (уязвимости и мудрость) ──
-    undef_block = re.search(r'НЕОПРЕДЕЛЁННЫЕ ЦЕНТРЫ[^\n]*:\n(.*?)(?=КАНАЛЫ|СОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+    # ── Состояния центров: определённый / неопределённый / открытый ──
     centers_idx = _build_centers_index()
-    undef_texts = []
-    if undef_block:
-        for c in undef_block.group(1).strip().split('\n'):
-            c = c.strip().lstrip('·•- ')
-            if not c:
-                continue
-            for key, val in centers_idx.items():
-                if c.lower() in key.lower() or key.lower() in c.lower():
-                    open_part = re.search(r'\*\*Открытый[^\*]*\*\*[:\s]*(.*?)(?=\*\*|$)', val, re.DOTALL)
-                    text = open_part.group(1).strip()[:350] if open_part else val[:350]
-                    undef_texts.append(f"Открытый центр {c}: {text}")
-                    break
-    if undef_texts:
-        sections.append("=== ОТКРЫТЫЕ ЦЕНТРЫ (уязвимости и потенциальная мудрость) ===\n" + '\n\n'.join(undef_texts))
+    def parse_centers(label):
+        match = re.search(rf'{label}[^\n]*:\n(.*?)(?=ОПРЕДЕЛЁННЫЕ|НЕОПРЕДЕЛЁННЫЕ|ОТКРЫТЫЕ|КАНАЛЫ|СОЗНАТЕЛЬНЫЕ|$)', raw, re.DOTALL)
+        if not match:
+            return []
+        values = [part.strip().lstrip('·•- ') for part in match.group(1).replace(',', '\n').splitlines() if part.strip()]
+        return [value for value in values if value.lower().rstrip('.') not in {'нет', 'none', 'n/a'}]
+
+    def center_text(center, status, limit=500):
+        for key, val in centers_idx.items():
+            if center.lower() == key.lower() or center.lower() in key.lower():
+                marker = {'defined': 'Определённый', 'undefined': 'Неопределённый', 'open': 'Открытый'}[status]
+                section = re.search(rf'\*\*{marker}[^\*]*\*\*[:\s]*(.*?)(?=\*\*|$)', val, re.DOTALL)
+                return (section.group(1).strip() if section else val.strip())[:limit]
+        return 'описание в библиотеке не найдено'
+
+    center_sections = [
+        ('ОПРЕДЕЛЁННЫЕ ЦЕНТРЫ', 'defined', 'устойчивые механики'),
+        ('НЕОПРЕДЕЛЁННЫЕ ЦЕНТРЫ', 'undefined', 'восприимчивость при наличии отдельных активаций'),
+        ('ОТКРЫТЫЕ ЦЕНТРЫ', 'open', 'восприимчивость без собственных активаций'),
+    ]
+    for label, status, title in center_sections:
+        entries = [f"{center}: {center_text(center, status)}" for center in parse_centers(label)]
+        if entries:
+            body = '\n\n'.join(entries)
+        else:
+            body = 'нет центров в этой категории; не добавлять свойства этой категории.'
+        sections.append(f"=== {label} ({title}) ===\n" + body)
 
     return '\n\n'.join(sections)
 
