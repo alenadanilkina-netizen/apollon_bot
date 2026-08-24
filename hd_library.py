@@ -56,8 +56,11 @@ def _build_gates_index() -> dict:
         end = selected[i+1].start() if i+1 < len(selected) else len(text)
         gate_text = text[start:end]
 
-        # В основном тексте заголовки выглядят как «1.1», а не «Линия 1».
-        line_pattern = re.compile(rf'(?m)^\s*{gate_num}\.([1-6])(?:[\.\s]|$)')
+        # Обычно заголовки выглядят как «13.1». В разделе первых ворот
+        # вторая линия в исходном переводе записана сокращённо: «2. Любовь
+        # это свет». Оба формата — часть одного и того же источника, поэтому
+        # принимаем и полный, и сокращённый заголовок, но только с начала строки.
+        line_pattern = re.compile(rf'(?m)^\s*(?:{gate_num}\.)?([1-6])(?:[\.\s]|$)')
         line_matches = list(line_pattern.finditer(gate_text))
 
         lines = {}
