@@ -1859,6 +1859,49 @@ def card_prompt(source: dict, question: str, line_number: int | None = None) -> 
 """
 
 
+def _oracle_clean_text(value: str, limit: int = 420) -> str:
+    """Готовит короткую выдержку из утверждённой библиотеки для Telegram."""
+    text = re.sub(r"Данный перевод не является официальным\..*", "", str(value), flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"===\s*стр\.?\s*\d+\s*===", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit].rstrip(" ,;:-")
+
+
+def _oracle_card_message(source: dict) -> str:
+    """Немедленное послание: колода не должна зависеть от доступности ИИ."""
+    raw_lines = [line.strip() for line in str(source.get("full", "")).splitlines() if line.strip()]
+    useful = [
+        line for line in raw_lines
+        if "гексаграмма" not in line.lower()
+        and "данный перевод" not in line.lower()
+    ]
+    title = useful[0] if useful else f"Карта {source.get('gate', '')}"
+    theme = useful[1] if len(useful) > 1 else "В ней есть важный угол для твоего вопроса."
+    return (
+        f"Оракул достал карту «{title}».\n\n"
+        f"{_oracle_clean_text(theme, 230)}\n\n"
+        "Она не выносит вердикт «да» или «нет». Сначала показывает, "
+        "на что стоит посмотреть прежде, чем делать вывод.\n\n"
+        "Теперь выбери число. Не ищи правильное — выбери то, которое первым задержало взгляд."
+    )
+
+
+def _oracle_line_message(source: dict, line_number: int) -> str:
+    """Второе послание карты из утверждённого текста, без сетевого вызова."""
+    raw = str(source.get("lines", {}).get(line_number, "")).strip()
+    match = re.match(r"\s*(?:\d+\.[1-6]|[1-6]\.)\s*([^:]+):\s*(.*)", raw, flags=re.DOTALL)
+    title = match.group(1).strip() if match else f"число {line_number}"
+    body = match.group(2).strip() if match else raw
+    # Знаки ▲/∇ открывают справочный слой. Оракулу нужен только смысл линии.
+    body = re.split(r"\s+[▲∇]", body, maxsplit=1)[0]
+    body = _oracle_clean_text(body, 300)
+    return (
+        f"Ты выбрала «{title}».\n\n"
+        f"{body}\n\n"
+        "Это не прогноз и не приказ. Это угол, под которым можно пересмотреть свой вопрос."
+    )
+
+
 async def send_oracle_card(message_obj, uid: int):
     """Тянет независимую от натала карту и присылает утверждённую иллюстрацию."""
     index = _build_gates_index()
@@ -1877,19 +1920,20 @@ async def send_oracle_card(message_obj, uid: int):
             "Для этой карты ещё не утверждён текст. Оракул не будет импровизировать вместо архива — задай вопрос ещё раз.",
         )
         return
+    oracle_message = _oracle_card_message(source)
     image_path = _card_image_path(gate_number)
     if image_path:
         try:
             with image_path.open("rb") as image_file:
-                await message_obj.reply_photo(photo=image_file)
+                await message_obj.reply_photo(
+                    photo=image_file,
+                    caption=oracle_message,
+                    reply_markup=ORACLE_LINE_KEYBOARD,
+                )
+                return
         except Exception as exc:
             print(f"WARN oracle image gate={gate_number}: {exc}")
-    reply = await ask_claude(uid, card_prompt(source, users[uid].get("oracle_question", "")))
-    await safe_send(message_obj, reply)
-    await message_obj.reply_text(
-        "Теперь выбери число. Не ищи правильное — выбери то, которое первым задержало взгляд.",
-        reply_markup=ORACLE_LINE_KEYBOARD,
-    )
+    await message_obj.reply_text(oracle_message, reply_markup=ORACLE_LINE_KEYBOARD)
 
 
 async def send_oracle_line(message_obj, uid: int, line_number: int):
@@ -1901,11 +1945,11 @@ async def send_oracle_line(message_obj, uid: int, line_number: int):
             reply_markup=ORACLE_RESULT_KEYBOARD,
         )
         return
-    reply = await ask_claude(
-        uid,
-        card_prompt(source, users[uid].get("oracle_question", ""), line_number=line_number),
+    await safe_send(
+        message_obj,
+        _oracle_line_message(source, line_number),
+        reply_markup=ORACLE_RESULT_KEYBOARD,
     )
-    await safe_send(message_obj, reply, reply_markup=ORACLE_RESULT_KEYBOARD)
 
 async def send_menu(update: Update):
     uid = update.effective_user.id
