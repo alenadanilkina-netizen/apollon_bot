@@ -14,6 +14,7 @@ import sys
 import sqlite3
 import re
 import random
+import traceback
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -65,6 +66,13 @@ AI_PROVIDER_ORDER = [
 ]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
+PRIVACY_POLICY_VERSION = "2026-08-25"
+# Перед публичным запуском эти реквизиты нужно заменить на фактические данные
+# оператора в Railway Variables. Не скрываем инфраструктуру за обещанием
+# «данные нигде не используются»: Telegram и хостинг неизбежно участвуют
+# в обработке сообщений.
+PRIVACY_OPERATOR_NAME = os.environ.get("PRIVACY_OPERATOR_NAME", "Алёна Данилкина")
+PRIVACY_CONTACT = os.environ.get("PRIVACY_CONTACT", "@danilkina")
 # До подключения оплаты оставляем мягкий режим: пользователь видит срок
 # пробного доступа, но не блокируется внезапно. Для запуска paywall на Railway
 # достаточно выставить TRIAL_ENFORCED=1.
@@ -103,6 +111,8 @@ def db_init():
             blocks_seen TEXT DEFAULT '[]',
             trial_started TEXT,
             brand_data   TEXT DEFAULT '{}',
+            consent_at   TEXT,
+            consent_version TEXT,
             first_seen  TEXT,
             last_seen   TEXT
         )
@@ -110,22 +120,48 @@ def db_init():
     # Миграция для уже существующей базы Railway Volume.
     existing = {row[1] for row in con.execute("PRAGMA table_info(users)").fetchall()}
     for column, sql_type in (("lat", "REAL"), ("lon", "REAL"), ("utc_offset", "REAL"),
-                             ("trial_started", "TEXT"), ("brand_data", "TEXT")):
+                             ("trial_started", "TEXT"), ("brand_data", "TEXT"),
+                             ("consent_at", "TEXT"), ("consent_version", "TEXT")):
         if column not in existing:
             con.execute(f"ALTER TABLE users ADD COLUMN {column} {sql_type}")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS consent_log (
+            tg_id INTEGER PRIMARY KEY,
+            consent_at TEXT NOT NULL,
+            policy_version TEXT NOT NULL
+        )
+    """)
+    con.commit()
+    con.close()
+
+
+def db_save_consent(tg_id: int, consent_at: str) -> None:
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT OR REPLACE INTO consent_log (tg_id, consent_at, policy_version) VALUES (?,?,?)",
+        (tg_id, consent_at, PRIVACY_POLICY_VERSION),
+    )
+    con.commit()
+    con.close()
+
+
+def db_delete_user_data(tg_id: int) -> None:
+    con = sqlite3.connect(DB_PATH)
+    con.execute("DELETE FROM users WHERE tg_id=?", (tg_id,))
+    con.execute("DELETE FROM consent_log WHERE tg_id=?", (tg_id,))
     con.commit()
     con.close()
 
 def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str = "",
-                 trial_started: datetime | None = None):
+                 trial_started: datetime | None = None, consent_at: str | None = None):
     con = sqlite3.connect(DB_PATH)
     now = datetime.now().isoformat()
     trial_started_iso = (trial_started or datetime.now()).isoformat()
     con.execute("""
         INSERT INTO users (tg_id, username, name, birth_day, birth_month, birth_year,
             birth_hour, birth_minute, city, lat, lon, utc_offset, hd_type,
-            trial_started, brand_data, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            trial_started, brand_data, consent_at, consent_version, first_seen, last_seen)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(tg_id) DO UPDATE SET
             username=excluded.username, name=excluded.name,
             birth_day=excluded.birth_day, birth_month=excluded.birth_month,
@@ -135,12 +171,14 @@ def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str
             hd_type=excluded.hd_type,
             trial_started=COALESCE(users.trial_started, excluded.trial_started),
             brand_data=COALESCE(users.brand_data, excluded.brand_data),
+            consent_at=COALESCE(users.consent_at, excluded.consent_at),
+            consent_version=COALESCE(users.consent_version, excluded.consent_version),
             last_seen=excluded.last_seen
     """, (tg_id, username, name,
           birth.get("day"), birth.get("month"), birth.get("year"),
           birth.get("hour"), birth.get("minute"), birth.get("city",""),
           birth.get("lat"), birth.get("lon"), birth.get("utc_offset"),
-          hd_type, trial_started_iso, "{}", now, now))
+          hd_type, trial_started_iso, "{}", consent_at, PRIVACY_POLICY_VERSION if consent_at else None, now, now))
     con.commit()
     con.close()
 
@@ -257,7 +295,7 @@ db_init()
 # ─── СОСТОЯНИЯ ДИАЛОГА ───────────────────────────────────────────────────────
 
 ASK_CONSENT, ASK_ENTRY, ASK_NAME, ASK_DATE, ASK_TIME, ASK_PLACE, ASK_QUESTION, CHAT, \
-COMPAT_NAME, COMPAT_DATE, COMPAT_TIME, COMPAT_PLACE = range(12)
+COMPAT_NAME, COMPAT_DATE, COMPAT_TIME, COMPAT_PLACE, ASK_BIRTH = range(13)
 
 
 FIRST_OLYMPUS_TEXT = (
@@ -841,6 +879,19 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ASK_ENTRY
 
 
+async def delete_my_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Удаляет сохранённую карту и согласие по прямой команде пользователя."""
+    uid = update.effective_user.id
+    db_delete_user_data(uid)
+    users.pop(uid, None)
+    await update.message.reply_text(
+        "Сохранённые данные и карта удалены из базы бота. "
+        "Переписка остаётся в Telegram и управляется настройками самого Telegram. "
+        "Если захочешь начать заново — напиши /start."
+    )
+    return ConversationHandler.END
+
+
 async def after_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         FIRST_OLYMPUS_TEXT,
@@ -856,6 +907,120 @@ async def ask_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Хорошо, {users[uid]['name']}. Дата рождения — день, месяц, год. Например: 23.02.1981"
     )
     return ASK_DATE
+
+
+def parse_birth_payload(text: str) -> tuple[dict, str] | None:
+    """Разбирает одну строку: 23.02.1981, 09:50, Суленцин, Польша."""
+    raw = (text or "").strip()
+    date_match = re.search(r"(?<!\d)(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})(?!\d)", raw)
+    time_match = next(
+        (match for match in re.finditer(r"(?<!\d)(\d{1,2})[:.](\d{2})(?!\d)", raw)
+         if not (date_match and match.start() >= date_match.start() and match.end() <= date_match.end())),
+        None,
+    )
+    if not date_match or not time_match:
+        return None
+    try:
+        day, month, year = map(int, date_match.groups())
+        hour, minute = map(int, time_match.groups())
+        # datetime проверяет существование даты, а не только формат.
+        datetime(year, month, day, hour, minute)
+    except ValueError:
+        return None
+
+    # Место — всё, что осталось после даты и времени. Поддерживаем и запятую,
+    # и тире, но в подсказке оставляем один простой формат.
+    spans = sorted((date_match.span(), time_match.span()), reverse=True)
+    remainder = raw
+    for start, end in spans:
+        remainder = remainder[:start] + " " + remainder[end:]
+    place = re.sub(r"^[\s,;—–\-]+|[\s,;—–\-]+$", "", remainder)
+    place = re.sub(r"\s{2,}", " ", place).strip()
+    if len(place) < 3 or not any(ch.isalpha() for ch in place):
+        return None
+    return ({"day": day, "month": month, "year": year, "hour": hour, "minute": minute}, place)
+
+
+async def _finish_birth_calculation(update: Update, uid: int) -> int:
+    """Единый безопасный финал ввода рождения — исключает зависание между шагами."""
+    birth = users[uid]["birth"]
+    city = birth["city"]
+    await update.message.reply_text("Смотрю в карту. Совет собирается...")
+    try:
+        natal, hd = await asyncio.wait_for(calculate_chart(birth), timeout=45)
+        users[uid]["chart"] = natal
+        users[uid]["hd"] = hd
+
+        username = update.effective_user.username or ""
+        name = users[uid].get("name") or update.effective_user.first_name or "Гость Олимпа"
+        users[uid]["name"] = name
+        hd_raw = hd.get("raw", "")
+        hd_type = next((line.strip() for line in hd_raw.splitlines()
+                        if "Тип:" in line or "TYPE" in line.upper()), "")
+        db_save_user(uid, username, name, birth, hd_type,
+                     trial_started=users[uid].get("trial_start"),
+                     consent_at=users[uid].get("consent_at"))
+
+        await update.message.reply_text(
+            f"{name}, личная карта построена.\n\n"
+            "Я вижу, где находятся планеты, дома и твои расчётные настройки Дизайна Человека. "
+            "Теперь можно открывать залы по одной теме — так выводы не смешаются в один красивый, но бесполезный туман.\n\n"
+            "Блок ведущей неподвижной звезды подключим после загрузки утверждённого каталога звёзд и твоих интерпретаций: я не буду назначать её по памяти."
+        )
+        await update.message.reply_text(trial_banner(uid))
+        await update.message.reply_text("Олимп готов. Выбирай, с какой части себя начнём.",
+                                        reply_markup=olympus_menu_keyboard(uid))
+        users[uid]["menu_shown"] = True
+        return CHAT
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "Совет считает карту дольше обычного. Данные сохранены в этой сессии — "
+            "нажми /start и попробуй ещё раз через минуту."
+        )
+        return ASK_BIRTH
+    except Exception:
+        print(f"ERROR in birth calculation: {traceback.format_exc()}")
+        await update.message.reply_text(
+            "Посейдон снова намочил вычислительные таблички. Проверь город и страну "
+            "и пришли строку ещё раз: 23.02.1981, 09:50, Суленцин, Польша"
+        )
+        return ASK_BIRTH
+
+
+async def ask_birth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not users.get(uid, {}).get("consent"):
+        await update.message.reply_text(
+            "Сначала нужно согласие на обработку данных для построения карты. Нажми /start и выбери «Пойти на Олимп»."
+        )
+        return ASK_ENTRY
+    parsed = parse_birth_payload(update.message.text)
+    if not parsed:
+        await update.message.reply_text(
+            "Не разобрала строку. Пришли всё в одном сообщении, например:\n"
+            "23.02.1981, 09:50, Суленцин, Польша"
+        )
+        return ASK_BIRTH
+    birth, city = parsed
+    try:
+        # Геокодер — внешний сервис; ограничиваем и этот шаг, чтобы бот не
+        # оставлял человека без ответа при зависшем сетевом запросе.
+        coords = await asyncio.wait_for(asyncio.to_thread(parse_city, city, birth), timeout=12)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "Не успела проверить город. Пришли ту же строку ещё раз через минуту — данные не потеряны."
+        )
+        return ASK_BIRTH
+    if not coords:
+        await update.message.reply_text(
+            f"Не нашла координаты для «{city}». Напиши город и страну точнее, например:\n"
+            "23.02.1981, 09:50, Суленцин, Польша"
+        )
+        return ASK_BIRTH
+    lat, lon, utc = coords
+    birth.update({"city": city, "lat": lat, "lon": lon, "utc_offset": utc})
+    users.setdefault(uid, {})["birth"] = birth
+    return await _finish_birth_calculation(update, uid)
 
 
 async def ask_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1812,7 +1977,12 @@ def _card_source(gate_number: int) -> dict:
         for key, value in lines.items()
         if str(key).isdigit() and str(value).strip()
     }
-    return {"gate": gate_number, "full": full, "lines": normalized_lines}
+    return {
+        "gate": gate_number,
+        "full": full,
+        "oracle_full": str(data.get("oracle_full", full)).strip(),
+        "lines": normalized_lines,
+    }
 
 
 def _choose_card_gate(uid: int, exclude: int | None = None) -> int:
@@ -1867,7 +2037,46 @@ def _oracle_clean_text(value: str, limit: int = 420) -> str:
     return text[:limit].rstrip(" ,;:-")
 
 
-def _oracle_card_message(source: dict) -> str:
+def _oracle_paragraphs(value: str, limit: int = 760) -> list[str]:
+    """Берёт из библиотеки только читабельные абзацы, без служебных пометок."""
+    raw = str(value or "")
+    raw = re.sub(r"===\s*стр\.?\s*\d+\s*===", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"Данный перевод не является официальным\..*?запрещены[»\"\.]?", "", raw, flags=re.DOTALL | re.IGNORECASE)
+    paragraphs = []
+    total = 0
+    for paragraph in re.split(r"\n\s*\n", raw):
+        paragraph = re.sub(r"\s+", " ", paragraph).strip(" .")
+        lowered = paragraph.lower()
+        if (
+            len(paragraph) < 80
+            or "гексаграмма" in lowered
+            or "страница" in lowered
+            or paragraph.startswith(("▲", "∇"))
+        ):
+            continue
+        if total + len(paragraph) > limit:
+            paragraph = paragraph[: max(0, limit - total)].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        if paragraph:
+            paragraphs.append(paragraph)
+            total += len(paragraph)
+        if total >= limit or len(paragraphs) >= 2:
+            break
+    return paragraphs
+
+
+def _oracle_question_focus(question: str) -> str:
+    """Добавляет прикладной фокус, не выдавая карту за предсказание события."""
+    value = str(question or "").lower()
+    if any(word in value for word in ("отношен", "люб", "партн", "муж", "жен", "союз")):
+        return "В вопросе об отношениях это предлагает увидеть не только чувство, но и обмен: кто проявляет участие, кто умеет принимать его и где забота становится односторонней."
+    if any(word in value for word in ("работ", "деньг", "проект", "клиент", "карьер", "бизнес")):
+        return "В вопросе о деле и деньгах карта обращает внимание на практическую сторону: что именно поддерживает результат, какие ресурсы уже есть и где они расходуются без отдачи."
+    if any(word in value for word in ("выбор", "реш", "делать", "поступить")):
+        return "В вопросе о выборе карта просит посмотреть на условия решения: что ты готова поддерживать дальше и чем придётся расплачиваться за этот выбор."
+    return "Примерь её к своему вопросу буквально: где сейчас нужна поддержка, что требует бережного распределения сил и что ты уже пытаешься удержать в одиночку."
+
+
+def _oracle_card_message(source: dict, question: str = "") -> str:
     """Немедленное послание: колода не должна зависеть от доступности ИИ."""
     raw_lines = [line.strip() for line in str(source.get("full", "")).splitlines() if line.strip()]
     useful = [
@@ -1876,29 +2085,42 @@ def _oracle_card_message(source: dict) -> str:
         and "данный перевод" not in line.lower()
     ]
     title = useful[0] if useful else f"Карта {source.get('gate', '')}"
-    theme = useful[1] if len(useful) > 1 else "В ней есть важный угол для твоего вопроса."
+    theme_parts = []
+    for line in useful[1:]:
+        if line.startswith("Продолжая "):
+            break
+        theme_parts.append(line)
+        if len(theme_parts) == 2:
+            break
+    theme = " ".join(theme_parts) or "В ней есть важный угол для твоего вопроса."
+    context = _oracle_paragraphs(source.get("oracle_full", source.get("full", "")))
+    explanation = "\n\n".join(context)
     return (
         f"Оракул достал карту «{title}».\n\n"
         f"{_oracle_clean_text(theme, 230)}\n\n"
-        "Она не выносит вердикт «да» или «нет». Сначала показывает, "
-        "на что стоит посмотреть прежде, чем делать вывод.\n\n"
+        f"{explanation}\n\n"
+        f"{_oracle_question_focus(question)}\n\n"
         "Теперь выбери число. Не ищи правильное — выбери то, которое первым задержало взгляд."
     )
 
 
-def _oracle_line_message(source: dict, line_number: int) -> str:
+def _oracle_line_message(source: dict, line_number: int, question: str = "") -> str:
     """Второе послание карты из утверждённого текста, без сетевого вызова."""
     raw = str(source.get("lines", {}).get(line_number, "")).strip()
     match = re.match(r"\s*(?:\d+\.[1-6]|[1-6]\.)\s*([^:]+):\s*(.*)", raw, flags=re.DOTALL)
     title = match.group(1).strip() if match else f"число {line_number}"
     body = match.group(2).strip() if match else raw
-    # Знаки ▲/∇ открывают справочный слой. Оракулу нужен только смысл линии.
-    body = re.split(r"\s+[▲∇]", body, maxsplit=1)[0]
-    body = _oracle_clean_text(body, 300)
+    # Убираем только астрологические метки источника, но не его смысловой
+    # разбор: именно из-за прежнего отсечения после ▲/∇ линия превращалась
+    # в одну сухую справочную фразу.
+    body = _oracle_clean_text(body, 880)
+    body = re.sub(r"(?:▲|∇)\s*[А-ЯЁA-Z][а-яёa-z]+\.\s*", "", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    focus = _oracle_question_focus(question)
     return (
         f"Ты выбрала «{title}».\n\n"
         f"{body}\n\n"
-        "Это не прогноз и не приказ. Это угол, под которым можно пересмотреть свой вопрос."
+        f"{focus}"
     )
 
 
@@ -1920,14 +2142,21 @@ async def send_oracle_card(message_obj, uid: int):
             "Для этой карты ещё не утверждён текст. Оракул не будет импровизировать вместо архива — задай вопрос ещё раз.",
         )
         return
-    oracle_message = _oracle_card_message(source)
+    question = str(users.get(uid, {}).get("oracle_question", ""))
+    oracle_message = _oracle_card_message(source, question)
     image_path = _card_image_path(gate_number)
     if image_path:
         try:
             with image_path.open("rb") as image_file:
                 await message_obj.reply_photo(
                     photo=image_file,
-                    caption=oracle_message,
+                    caption="Оракул достал карту.",
+                )
+                # У Telegram лимит 1024 символа для подписи к картинке.
+                # Развёрнутый текст и кнопки отправляем вторым сообщением,
+                # но в той же операции, без ожидания ИИ.
+                await message_obj.reply_text(
+                    oracle_message,
                     reply_markup=ORACLE_LINE_KEYBOARD,
                 )
                 return
@@ -1947,7 +2176,7 @@ async def send_oracle_line(message_obj, uid: int, line_number: int):
         return
     await safe_send(
         message_obj,
-        _oracle_line_message(source, line_number),
+        _oracle_line_message(source, line_number, str(users.get(uid, {}).get("oracle_question", ""))),
         reply_markup=ORACLE_RESULT_KEYBOARD,
     )
 
@@ -2042,13 +2271,36 @@ async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
+    if query.data == "privacy_policy":
+        await query.message.reply_text(
+            f"Политика конфиденциальности (версия {PRIVACY_POLICY_VERSION})\n\n"
+            f"Оператор: {PRIVACY_OPERATOR_NAME}. Контакт по вопросам данных: {PRIVACY_CONTACT}.\n\n"
+            "Что обрабатывается: Telegram ID, имя/ник, дата, время и место рождения, а также сообщения, "
+            "которые ты добровольно отправляешь боту.\n\n"
+            "Зачем: построить личную карту, хранить её для повторного доступа и поддерживать диалог бота. "
+            "Мы не продаём и не публикуем эти данные.\n\n"
+            "Где: сообщения проходят через Telegram; техническое хранение бота происходит в его базе данных "
+            "на инфраструктуре Railway. При использовании функции ИИ текст запроса может быть передан "
+            "подключённому ИИ-провайдеру только для формирования ответа.\n\n"
+            "Срок: до удаления по запросу пользователя или прекращения работы бота. Чтобы отозвать согласие "
+            "и удалить сохранённую карту, используй команду /delete_my_data или напиши оператору: " + PRIVACY_CONTACT + ".\n\n"
+            "Продолжая, ты можешь вернуться к согласию ниже."
+        )
+        return ASK_CONSENT
+
     if query.data in {"consent_yes", "personal_consent_yes"}:
         users[uid]["consent"] = True
+        users[uid]["consent_at"] = datetime.now().isoformat()
+        db_save_consent(uid, users[uid]["consent_at"])
         if not isinstance(users[uid].get("trial_start"), datetime):
             users[uid]["trial_start"] = datetime.now()
         if query.data == "personal_consent_yes":
-            await query.message.reply_text("Как тебя зовут?")
-            return ASK_NAME
+            await query.message.reply_text(
+                "Напиши дату, время и место рождения одним сообщением.\n\n"
+                "Формат: 23.02.1981, 09:50, Суленцин, Польша\n\n"
+                "Точное время особенно важно: оно влияет на дома карты и расчёт Дизайна Человека."
+            )
+            return ASK_BIRTH
         await query.message.reply_text(
             FIRST_OLYMPUS_TEXT,
             reply_markup=ENTRY_KEYBOARD,
@@ -2163,13 +2415,16 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "oracle_to_olympus":
         consent_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Продолжить", callback_data="personal_consent_yes")],
+            [InlineKeyboardButton("Открыть политику конфиденциальности", callback_data="privacy_policy")],
+            [InlineKeyboardButton("Согласна: построить мою карту", callback_data="personal_consent_yes")],
             [InlineKeyboardButton("Не сейчас", callback_data="personal_consent_no")],
         ])
         await query.message.reply_text(
-            "Чтобы понять, какое место тебе выделить на Олимпе, нам нужно найти твою звезду.\n\n"
-            "Для этого я построю личную карту по дате, точному времени и месту рождения. "
-            "Данные используются только для расчёта твоей карты.",
+            "Чтобы понять, какое место тебе выделить на Олимпе, нужно найти твою звезду.\n\n"
+            "Для этого понадобятся дата, точное время и место рождения — это персональные данные. "
+            "Я использую их для расчёта карты и её сохранения для твоего повторного доступа. "
+            "Сообщения проходят через Telegram, а техническое хранение бота работает на Railway.\n\n"
+            "Без согласия построить личную карту нельзя; к Оракулу можно возвращаться и без неё.",
             reply_markup=consent_kb,
         )
         return ASK_CONSENT
@@ -2493,8 +2748,11 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "trial_start": trial_start,
             "brand_data": users[uid].get("brand_data", {}),
         }
-        await update.message.reply_text("Начнём заново. Как тебя зовут?")
-        return ASK_NAME
+        await update.message.reply_text(
+            "Начнём заново. Сначала нужно согласие на обработку данных для личной карты. "
+            "Нажми «Пойти на Олимп» в меню Оракула или отправь /start."
+        )
+        return ASK_ENTRY
 
     if users[uid].get("brand_ai_chat"):
         try:
@@ -2678,6 +2936,7 @@ def main():
             ASK_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_date)],
             ASK_TIME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             ASK_PLACE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_place)],
+            ASK_BIRTH:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_birth)],
             ASK_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_oracle_question),
                            CallbackQueryHandler(handle_button)],
             CHAT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, chat),
@@ -2691,6 +2950,8 @@ def main():
         allow_reentry=True,
     )
 
+    # Команда должна работать из любого шага диалога, включая ввод рождения.
+    app.add_handler(CommandHandler("delete_my_data", delete_my_data))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(handle_button))
 

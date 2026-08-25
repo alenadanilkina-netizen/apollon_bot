@@ -76,6 +76,10 @@ def _build_gates_index() -> dict:
 
         index[gate_num] = {
             'full': _clean_library_excerpt(gate_text[:300], 300),
+            # Оракулу нужен более развёрнутый фрагмент, чем техническому
+            # контексту расчёта. Отдельное поле не раздувает остальные
+            # интерпретации бота, но даёт человеку объяснение самой карты.
+            'oracle_full': _clean_library_excerpt(gate_text[:1800], 1800),
             'lines': lines
         }
 
