@@ -3093,6 +3093,17 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 
 def main():
+    # Один GitHub-репозиторий всё ещё подключён к двум старым Railway-проектам.
+    # Telegram long polling допускает только один активный экземпляр бота, поэтому
+    # второй проект должен завершиться до обращения к Telegram API.
+    railway_project = os.environ.get("RAILWAY_PROJECT_NAME", "").strip()
+    if railway_project and railway_project != "hearty-stillness":
+        print(
+            "Bot startup skipped: this repository is active only in "
+            f"hearty-stillness (current project: {railway_project})."
+        )
+        return
+
     if not TELEGRAM_TOKEN:
         print("❌ Нужен TELEGRAM_TOKEN в переменных окружения")
         print("   export TELEGRAM_TOKEN='ваш_токен'")
