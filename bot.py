@@ -373,24 +373,21 @@ async def call_mcp_async(tool: str, params: dict) -> dict:
     return await asyncio.to_thread(call_mcp, tool, params)
 
 async def calculate_chart(birth: dict) -> tuple[dict, dict]:
-    """Считает натальную карту и HD (async)"""
-    print(f"DEBUG calculate_chart: year={birth.get('year')} month={birth.get('month')} day={birth.get('day')} "
-          f"hour={birth.get('hour')} minute={birth.get('minute')} tz={birth.get('utc_offset')} "
-          f"lat={birth.get('lat')} lon={birth.get('lon')}")
-    natal, hd = await asyncio.gather(
-        call_mcp_async("natal_chart", {
-            "year": birth["year"], "month": birth["month"], "day": birth["day"],
-            "hour": birth["hour"], "minute": birth["minute"],
-            "timezone": birth["utc_offset"],
-            "lat": birth["lat"], "lon": birth["lon"]
-        }),
-        call_mcp_async("human_design", {
-            "year": birth["year"], "month": birth["month"], "day": birth["day"],
-            "hour": birth["hour"], "minute": birth["minute"],
-            "timezone": birth["utc_offset"],
-            "lat": birth["lat"], "lon": birth["lon"]
-        })
-    )
+    """Считает натальную карту и HD без параллельного доступа к эфемеридам.
+
+    Swiss Ephemeris хранит часть состояния глобально. Два одновременных
+    обращения из разных потоков иногда зависали в Railway после сообщения
+    «Совет собирается». Последовательный расчёт занимает почти столько же,
+    зато одинаково работает локально и в контейнере.
+    """
+    params = {
+        "year": birth["year"], "month": birth["month"], "day": birth["day"],
+        "hour": birth["hour"], "minute": birth["minute"],
+        "timezone": birth["utc_offset"],
+        "lat": birth["lat"], "lon": birth["lon"],
+    }
+    natal = await call_mcp_async("natal_chart", params)
+    hd = await call_mcp_async("human_design", params)
     return natal, hd
 
 
@@ -2020,6 +2017,40 @@ ORACLE_LINE_FRAMES: dict[int, tuple[str, str]] = {
 }
 
 
+ORACLE_LINE_APPLICATIONS: dict[int, str] = {
+    1: (
+        "Для твоего вопроса это проверка основания. Назови факты, которые уже есть, "
+        "и отдельно — то, что ты только предполагаешь. Решение станет яснее, когда у него "
+        "появится один надёжный критерий, а не десять тревожных догадок."
+    ),
+    2: (
+        "Здесь полезно заметить собственный естественный способ действовать. Посмотри, "
+        "что у тебя уже получается без лишнего доказательства и напряжения. Возможно, "
+        "ответ не нужно изобретать: его нужно перестать заглушать чужими ожиданиями."
+    ),
+    3: (
+        "Эта грань предлагает не строить окончательную теорию, а провести небольшой "
+        "обратимый эксперимент. Выбери действие, после которого появятся новые факты. "
+        "Результат опыта важнее попытки заранее предусмотреть каждую ошибку."
+    ),
+    4: (
+        "Ответ проясняется через конкретный контакт. Вспомни, с кем нужно поговорить, "
+        "какой вопрос задать и какую договорённость назвать вслух. Хороший разговор здесь "
+        "не заменяет решение, но показывает, существует ли встречное движение."
+    ),
+    5: (
+        "Теперь посмотри на последствия и обещания. Что от тебя действительно зависит, "
+        "а что тебе пытаются передать вместе с красивым ожиданием? Сила этой позиции — "
+        "в ясной ответственности, которую можно выполнить, а не торжественно объявить."
+    ),
+    6: (
+        "Отойди от сегодняшней сцены и посмотри на повторяющийся рисунок. Если продолжать "
+        "так же несколько месяцев, куда приведёт этот выбор? Дистанция нужна не для "
+        "холодности, а чтобы отличить важную историю от очередного эпизода."
+    ),
+}
+
+
 def card_prompt(source: dict, question: str, line_number: int | None = None) -> str:
     line_fragment = source.get("lines", {}).get(line_number, "") if line_number else ""
     section = "первое послание" if line_number is None else "второй слой послания"
@@ -2066,6 +2097,97 @@ def _oracle_clean_text(value: str, limit: int = 1200) -> str:
         return fragment[: last_stop + 1].strip()
     last_space = fragment.rfind(" ")
     return fragment[:last_space].rstrip(" ,;:-") + "…"
+
+
+_ORACLE_TECHNICAL_RE = re.compile(
+    r"(?:экзальтац\w*|\bв\s+(?:ущербе|падении)\b|"
+    r"\b(?:солнц\w*|земл\w*|лун\w*|меркур\w*|венер\w*|марс\w*|юпитер\w*|"
+    r"сатурн\w*|уран\w*|нептун\w*|плутон\w*)\b|g[-‐‑–— ]?центр|сакральн\w*\s+центр|"
+    r"рейв[- ]?карт|бодиграф|дизайн\w*\s+человек|верхн\w*\s+триграмм|"
+    r"нижн\w*\s+триграмм|контур\w*|канал\s+\d|полярност\w*|"
+    r"манифест\w*|генератор\w*|проектор\w*|рефлектор\w*|"
+    r"\b(?:первая|вторая|третья|четв[её]ртая|пятая|шестая)\s+линия\b|"
+    r"\bу\s+(?:первой|второй|третьей|четв[её]ртой|пятой|шестой)\s+линии\b)",
+    re.IGNORECASE,
+)
+
+
+def _oracle_library_sentences(value: str, limit: int = 3000) -> list[str]:
+    """Возвращает законченные смысловые фразы источника без учебной разметки."""
+    raw = str(value or "")
+    raw = re.sub(r"===\s*стр\.?\s*\d+\s*===", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"Данный перевод не является официальным\..*", " ", raw,
+                 flags=re.DOTALL | re.IGNORECASE)
+    raw = re.sub(r"Гексаграмма\s*\d+", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"(?m)^\s*\d{1,2}\.[1-6]\s*", " ", raw)
+    raw = re.sub(r"[▲△∇▼]", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    candidates = re.split(r"(?<=[.!?…])\s+(?=[А-ЯЁA-Z«])", raw)
+    result: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for sentence in candidates:
+        sentence = sentence.strip(" \n\t—–-")
+        sentence = re.sub(r"^\d{1,2}\.[1-6]\s*", "", sentence)
+        if len(sentence) < 38 or _ORACLE_TECHNICAL_RE.search(sentence):
+            continue
+        # Учебные обращения и ссылки на устройство книги не являются
+        # интерпретацией для человека.
+        lowered = sentence.lower()
+        if any(marker in lowered for marker in (
+            "если вы посмотрите", "поймите, что", "в комментарии говорится",
+            "над линиями говорится", "мы достигли", "переходя от", "страница",
+            "обратите внимание", "мы имеем дело", "как я уже говорил",
+            "следующие четыре", "следующие пять",
+        )):
+            continue
+        if lowered.strip(" .!?…«»\"") in {"да", "нет", "может быть"}:
+            continue
+        if not sentence.endswith((".", "!", "?", "…")):
+            continue
+        key = re.sub(r"[^а-яёa-z0-9]+", "", lowered)
+        if key in seen:
+            continue
+        if total + len(sentence) > limit:
+            break
+        seen.add(key)
+        result.append(sentence)
+        total += len(sentence) + 1
+        if len(result) >= 14:
+            break
+    return result
+
+
+def _oracle_sentence_key(value: str) -> str:
+    return re.sub(r"[^а-яёa-z0-9]+", "", value.lower())
+
+
+def _dedupe_oracle_message(value: str) -> str:
+    """Удаляет повторы из собранного ответа, сохраняя абзацы и финальные фразы."""
+    paragraphs: list[str] = []
+    seen: set[str] = set()
+    for paragraph in re.split(r"\n\s*\n", str(value or "")):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        sentences = re.split(r"(?<=[.!?…])\s+", paragraph)
+        unique: list[str] = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            key = _oracle_sentence_key(sentence)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(sentence)
+        if unique:
+            paragraphs.append(" ".join(unique))
+    return "\n\n".join(paragraphs)
+
+
+def _join_oracle_sentences(sentences: list[str], fallback: str = "") -> str:
+    text = " ".join(sentence.strip() for sentence in sentences if sentence.strip()).strip()
+    return text or fallback.strip()
 
 
 def _oracle_paragraphs(value: str, limit: int = 1450) -> list[str]:
@@ -2118,37 +2240,51 @@ def _oracle_question_focus(question: str) -> str:
 
 
 def _oracle_card_message(source: dict, question: str = "") -> str:
-    """Немедленное цельное послание без технических выдержек библиотеки."""
+    """Полное первое чтение: смысл карты из библиотеки плюс применение."""
     gate = int(source.get("gate") or 0)
     title, theme, insight, caution = ORACLE_CARD_PROFILES.get(
         gate,
         ("Наблюдение", "вопросе, который требует внимательного взгляда", "Сделай паузу и отдели факты от предположений.", "Не торопись с окончательным выводом."),
     )
-    return (
+    source_text = _join_oracle_sentences(
+        _oracle_library_sentences(source.get("oracle_full", ""), limit=2700)
+    )
+    source_block = f"{source_text}\n\n" if source_text else ""
+    message = (
         f"Оракул достал карту «{title}».\n\n"
         f"Эта карта — о {theme}.\n\n"
+        f"{source_block}"
         f"{insight}\n\n"
         f"{caution}\n\n"
         f"{_oracle_question_focus(question)}\n\n"
         "Теперь выбери число. Не ищи правильное — выбери то, которое первым задержало взгляд."
     )
+    return _dedupe_oracle_message(message)
 
 
 def _oracle_line_message(source: dict, line_number: int, question: str = "") -> str:
-    """Второе послание: шесть углов чтения без оборванных строк источника."""
+    """Второе чтение: отдельный полный текст выбранной линии без повтора карты."""
     gate = int(source.get("gate") or 0)
-    card_title, _theme, insight, caution = ORACLE_CARD_PROFILES.get(
+    card_title, _theme, _insight, _caution = ORACLE_CARD_PROFILES.get(
         gate,
         ("Наблюдение", "вопросе, который требует внимательного взгляда", "Сделай паузу и отдели факты от предположений.", "Не торопись с окончательным выводом."),
     )
     line_title, frame = ORACLE_LINE_FRAMES.get(line_number, ("Угол карты", "Посмотри на ситуацию чуть внимательнее."))
-    focus = _oracle_question_focus(question)
-    return (
-        f"Ты выбрала «{line_title}».\n\n"
-        f"Карта «{card_title}» показывает, как эта тема проявляется в твоём вопросе. {frame}\n\n"
-        f"{insight} {caution}\n\n"
-        f"{focus}"
+    line_source = _join_oracle_sentences(
+        _oracle_library_sentences(source.get("lines", {}).get(line_number, ""), limit=2900)
     )
+    if not line_source:
+        line_source = frame
+    application = ORACLE_LINE_APPLICATIONS.get(line_number, "")
+    message = (
+        f"Ты выбрала «{line_title}».\n\n"
+        f"У карты «{card_title}» эта грань раскрывается так: {frame}\n\n"
+        f"{line_source}\n\n"
+        f"{application}\n\n"
+        "Вернись к своему вопросу и проверь, где эта ситуация уже проявилась: "
+        "в твоих действиях, договорённостях или реакции другого человека."
+    )
+    return _dedupe_oracle_message(message)
 
 
 async def send_oracle_card(message_obj, uid: int):
@@ -2158,10 +2294,7 @@ async def send_oracle_card(message_obj, uid: int):
     # учебной библиотеке.
     eligible_gates = sorted(ORACLE_CARD_PROFILES)
     gate_number = random.SystemRandom().choice(eligible_gates)
-    # Оракул не читает учебные выдержки: они предназначены для внутренней
-    # библиотеки и могут содержать обрывки терминов. Для карточки нужен
-    # только номер — текст берётся из утверждённого пользовательского слоя.
-    source = {"gate": gate_number}
+    source = _card_source(gate_number)
     users[uid]["current_card_gate"] = gate_number
     question = str(users.get(uid, {}).get("oracle_question", ""))
     oracle_message = _oracle_card_message(source, question)
@@ -2188,7 +2321,7 @@ async def send_oracle_card(message_obj, uid: int):
 
 async def send_oracle_line(message_obj, uid: int, line_number: int):
     gate_number = users.get(uid, {}).get("current_card_gate")
-    source = {"gate": gate_number} if gate_number else {}
+    source = _card_source(int(gate_number)) if gate_number else {}
     if int(gate_number or 0) not in ORACLE_CARD_PROFILES or line_number not in ORACLE_LINE_FRAMES:
         await message_obj.reply_text(
             "Эта карта не успела сохраниться. Задай вопрос ещё раз — колода ответит сразу.",

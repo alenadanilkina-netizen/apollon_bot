@@ -63,23 +63,33 @@ def _build_gates_index() -> dict:
         line_pattern = re.compile(rf'(?m)^\s*(?:{gate_num}\.)?([1-6])(?:[\.\s]|$)')
         line_matches = list(line_pattern.finditer(gate_text))
 
-        lines = {}
-        for j, lm in enumerate(line_matches):
+        # Для Оракула важен полный, а не случайно усечённый текст. Оставляем
+        # первое реальное вхождение каждой из шести линий и режем строго по
+        # следующему заголовку. Старый лимит в 600 знаков обрывал предложения.
+        unique_line_matches = []
+        seen_line_numbers = set()
+        for lm in line_matches:
             line_num = int(lm.group(1))
-            if line_num in lines:
-                continue
+            if line_num not in seen_line_numbers:
+                seen_line_numbers.add(line_num)
+                unique_line_matches.append(lm)
+
+        lines = {}
+        for j, lm in enumerate(unique_line_matches):
+            line_num = int(lm.group(1))
             ls = lm.start()
-            # Берём до следующего уникального заголовка линии.
-            next_line = next((n for n in line_matches[j+1:] if int(n.group(1)) not in lines), None)
-            le = next_line.start() if next_line else len(gate_text)
-            lines[line_num] = _clean_library_excerpt(gate_text[ls:le], 600)
+            le = unique_line_matches[j + 1].start() if j + 1 < len(unique_line_matches) else len(gate_text)
+            lines[line_num] = _clean_library_excerpt(gate_text[ls:le], 2800)
+
+        intro_end = unique_line_matches[0].start() if unique_line_matches else len(gate_text)
+        gate_intro = gate_text[:intro_end]
 
         index[gate_num] = {
             'full': _clean_library_excerpt(gate_text[:300], 300),
             # Оракулу нужен более развёрнутый фрагмент, чем техническому
             # контексту расчёта. Отдельное поле не раздувает остальные
             # интерпретации бота, но даёт человеку объяснение самой карты.
-            'oracle_full': _clean_library_excerpt(gate_text[:1800], 1800),
+            'oracle_full': _clean_library_excerpt(gate_intro, 3000),
             'lines': lines
         }
 
