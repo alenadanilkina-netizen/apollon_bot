@@ -66,6 +66,7 @@ AI_PROVIDER_ORDER = [
 ]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
+AI_RESPONSE_TIMEOUT_SECONDS = int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "90"))
 PRIVACY_POLICY_VERSION = "2026-08-25"
 # Перед публичным запуском эти реквизиты нужно заменить на фактические данные
 # оператора в Railway Variables. Не скрываем инфраструктуру за обещанием
@@ -701,7 +702,10 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
     return reply
 
 async def ask_claude(user_id: int, message: str) -> str:
-    return await asyncio.to_thread(_ask_claude_sync, user_id, message)
+    return await asyncio.wait_for(
+        asyncio.to_thread(_ask_claude_sync, user_id, message),
+        timeout=AI_RESPONSE_TIMEOUT_SECONDS,
+    )
 
 
 # Единое имя для новых обработчиков; старые сценарии сохраняют совместимость.
@@ -2100,11 +2104,12 @@ def _oracle_clean_text(value: str, limit: int = 1200) -> str:
 
 
 _ORACLE_TECHNICAL_RE = re.compile(
-    r"(?:экзальтац\w*|\bв\s+(?:ущербе|падении)\b|"
+    r"(?:экзальтац\w*|\b(?:ущерб\w*|падени\w*)\b|"
     r"\b(?:солнц\w*|земл\w*|лун\w*|меркур\w*|венер\w*|марс\w*|юпитер\w*|"
     r"сатурн\w*|уран\w*|нептун\w*|плутон\w*)\b|g[-‐‑–— ]?центр|сакральн\w*\s+центр|"
     r"рейв[- ]?карт|бодиграф|дизайн\w*\s+человек|верхн\w*\s+триграмм|"
-    r"нижн\w*\s+триграмм|контур\w*|канал\s+\d|полярност\w*|"
+    r"нижн\w*\s+триграмм|контур\w*|канал\s+\d|полярност\w*|монопол\w*|"
+    r"\b\d{1,2}\.[1-6]\b|\b\d[-‑]?й\s+лини\w*|\bворот\w*\s+\d|"
     r"манифест\w*|генератор\w*|проектор\w*|рефлектор\w*|"
     r"\b(?:первая|вторая|третья|четв[её]ртая|пятая|шестая)\s+линия\b|"
     r"\bу\s+(?:первой|второй|третьей|четв[её]ртой|пятой|шестой)\s+линии\b)",
@@ -2304,7 +2309,6 @@ async def send_oracle_card(message_obj, uid: int):
             with image_path.open("rb") as image_file:
                 await message_obj.reply_photo(
                     photo=image_file,
-                    caption="Оракул достал карту.",
                 )
                 # У Telegram лимит 1024 символа для подписи к картинке.
                 # Развёрнутый текст и кнопки отправляем вторым сообщением,
@@ -2764,56 +2768,62 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("forecast_"):
         birth = users[uid].get("birth", {})
         today = datetime.now()
-        transits_str = await collect_transit_snapshots(query.data, birth, today)
-
-        extra_str = ""
-        if query.data == "forecast_year":
-            try:
-                solar_raw = await call_mcp_async("solar_return", {
-                    "birth_year": birth["year"], "birth_month": birth["month"],
-                    "birth_day": birth["day"], "birth_hour": birth["hour"],
-                    "birth_minute": birth.get("minute", 0),
-                    "birth_timezone": birth["utc_offset"],
-                    "lat": birth["lat"], "lon": birth["lon"],
-                    "return_year": today.year,
-                })
-                extra_str += "\n\nСОЛЯР (карта года):\n" + solar_raw.get("raw", str(solar_raw))
-            except Exception as e:
-                extra_str += f"\n(соляр недоступен: {e})"
-            try:
-                hd_raw = await call_mcp_async("hd_cycles", {
-                    "birth_year": birth["year"], "birth_month": birth["month"],
-                    "birth_day": birth["day"], "birth_hour": birth["hour"],
-                    "birth_minute": birth.get("minute", 0),
-                    "birth_timezone": birth["utc_offset"],
-                    "cycle_year": today.year,
-                })
-                extra_str += "\n\nHD-ЦИКЛЫ (ворота года):\n" + hd_raw.get("raw", str(hd_raw))
-            except Exception as e:
-                extra_str += f"\n(HD-циклы недоступны: {e})"
-
-        if query.data == "forecast_month":
-            try:
-                lunar_raw = await call_mcp_async("lunar_return", {
-                    "birth_year": birth["year"], "birth_month": birth["month"],
-                    "birth_day": birth["day"], "birth_hour": birth["hour"],
-                    "birth_minute": birth.get("minute", 0),
-                    "birth_timezone": birth["utc_offset"],
-                    "lat": birth["lat"], "lon": birth["lon"],
-                    "from_year": today.year, "from_month": today.month, "from_day": today.day,
-                })
-                extra_str += "\n\nЛУНАР (карта месяца):\n" + lunar_raw.get("raw", str(lunar_raw))
-            except Exception as e:
-                extra_str += f"\n(лунар недоступен: {e})"
-
-        name = users[uid].get("name", "")
-        prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
+        await query.message.reply_text("Смотрю, что происходит на небе...")
         try:
-            await query.message.reply_text("Смотрю что происходит на небе...")
+            transits_str = await collect_transit_snapshots(query.data, birth, today)
+
+            extra_str = ""
+            if query.data == "forecast_year":
+                try:
+                    solar_raw = await call_mcp_async("solar_return", {
+                        "birth_year": birth["year"], "birth_month": birth["month"],
+                        "birth_day": birth["day"], "birth_hour": birth["hour"],
+                        "birth_minute": birth.get("minute", 0),
+                        "birth_timezone": birth["utc_offset"],
+                        "lat": birth["lat"], "lon": birth["lon"],
+                        "return_year": today.year,
+                    })
+                    extra_str += "\n\nСОЛЯР (карта года):\n" + solar_raw.get("raw", str(solar_raw))
+                except Exception as exc:
+                    print(f"WARN forecast solar_return: {type(exc).__name__}: {exc}", flush=True)
+                try:
+                    hd_raw = await call_mcp_async("hd_cycles", {
+                        "birth_year": birth["year"], "birth_month": birth["month"],
+                        "birth_day": birth["day"], "birth_hour": birth["hour"],
+                        "birth_minute": birth.get("minute", 0),
+                        "birth_timezone": birth["utc_offset"],
+                        "cycle_year": today.year,
+                    })
+                    extra_str += "\n\nHD-ЦИКЛЫ (ворота года):\n" + hd_raw.get("raw", str(hd_raw))
+                except Exception as exc:
+                    print(f"WARN forecast hd_cycles: {type(exc).__name__}: {exc}", flush=True)
+
+            if query.data == "forecast_month":
+                try:
+                    lunar_raw = await call_mcp_async("lunar_return", {
+                        "birth_year": birth["year"], "birth_month": birth["month"],
+                        "birth_day": birth["day"], "birth_hour": birth["hour"],
+                        "birth_minute": birth.get("minute", 0),
+                        "birth_timezone": birth["utc_offset"],
+                        "lat": birth["lat"], "lon": birth["lon"],
+                        "from_year": today.year, "from_month": today.month, "from_day": today.day,
+                    })
+                    extra_str += "\n\nЛУНАР (карта месяца):\n" + lunar_raw.get("raw", str(lunar_raw))
+                except Exception as exc:
+                    print(f"WARN forecast lunar_return: {type(exc).__name__}: {exc}", flush=True)
+
+            name = users[uid].get("name", "")
+            prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
             reply = await ask_claude(uid, prompt)
             await safe_send(query.message, reply)
+        except asyncio.TimeoutError:
+            print("ERROR forecast: AI response timeout", flush=True)
+            await query.message.reply_text(
+                "Оракул задержался дольше обычного. Попробуй этот прогноз ещё раз через минуту."
+            )
+            return CHAT
         except Exception as exc:
-            print(f"ERROR forecast: {exc}")
+            print(f"ERROR forecast: {type(exc).__name__}: {exc}", flush=True)
             await query.message.reply_text("Не удалось получить прогноз сейчас. Попробуй ещё раз через минуту.")
             return CHAT
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
@@ -2821,6 +2831,10 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     prompt = BLOCK_PROMPTS.get(query.data, "")
     if not prompt:
+        await query.message.reply_text(
+            "Эта кнопка осталась от прежней версии Олимпа. Открываю актуальное меню.",
+            reply_markup=olympus_menu_keyboard(uid),
+        )
         return CHAT
 
     name = users[uid].get("name", "")
