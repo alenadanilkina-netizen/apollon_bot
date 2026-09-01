@@ -342,12 +342,30 @@ async def safe_send(message_obj, text: str, *, reply_markup=None, parse_mode="Ma
 
     for index, chunk in enumerate(chunks):
         markup = reply_markup if index == len(chunks) - 1 else None
-        try:
-            await message_obj.reply_text(chunk, parse_mode=parse_mode, reply_markup=markup)
-        except Exception as exc:
-            # Некорректный Markdown не должен превращаться в TELEGRAM_SEND.
-            print(f"WARN safe_send: Markdown rejected ({exc}); retrying plain text")
-            await message_obj.reply_text(chunk, reply_markup=markup)
+        last_error = None
+        # После загрузки тяжёлой картинки Telegram иногда не успевает вернуть
+        # соединение в пул. Повторяем именно текстовую отправку: карта при этом
+        # не дублируется, а клавиатура остаётся у последнего фрагмента.
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await message_obj.reply_text(
+                    chunk,
+                    parse_mode=parse_mode,
+                    reply_markup=markup,
+                    connect_timeout=20,
+                    read_timeout=30,
+                    write_timeout=30,
+                    pool_timeout=20,
+                )
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                print(f"WARN safe_send attempt={attempt}: {type(exc).__name__}: {exc}")
+        if last_error is not None:
+            raise last_error
 
 # ─── МЕТОДОЛОГИЯ ─────────────────────────────────────────────────────────────
 
@@ -2309,18 +2327,23 @@ async def send_oracle_card(message_obj, uid: int):
             with image_path.open("rb") as image_file:
                 await message_obj.reply_photo(
                     photo=image_file,
+                    connect_timeout=20,
+                    read_timeout=60,
+                    write_timeout=60,
+                    pool_timeout=20,
                 )
-                # У Telegram лимит 1024 символа для подписи к картинке.
-                # Развёрнутый текст и кнопки отправляем вторым сообщением,
-                # но в той же операции, без ожидания ИИ.
-                await message_obj.reply_text(
-                    oracle_message,
-                    reply_markup=ORACLE_LINE_KEYBOARD,
-                )
-                return
         except Exception as exc:
             print(f"WARN oracle image gate={gate_number}: {exc}")
-    await message_obj.reply_text(oracle_message, reply_markup=ORACLE_LINE_KEYBOARD)
+    # Картинка и чтение — две независимые доставки. Ошибка форматирования или
+    # временный сетевой сбой после upload не должны оставлять пользователя с
+    # одной немой картой. Тексты библиотеки отправляем как plain text.
+    await asyncio.sleep(0.25)
+    await safe_send(
+        message_obj,
+        oracle_message,
+        reply_markup=ORACLE_LINE_KEYBOARD,
+        parse_mode=None,
+    )
 
 
 async def send_oracle_line(message_obj, uid: int, line_number: int):
