@@ -2321,12 +2321,23 @@ async def send_oracle_card(message_obj, uid: int):
     users[uid]["current_card_gate"] = gate_number
     question = str(users.get(uid, {}).get("oracle_question", ""))
     oracle_message = _oracle_card_message(source, question)
+    card_title = ORACLE_CARD_PROFILES.get(gate_number, ("Послание",))[0]
+    # Подпись и выбор линии отправляем вместе с изображением. Это оставляет
+    # человеку рабочую карту даже в редком случае, когда следующий большой
+    # текст Telegram доставляет с задержкой или временно отклоняет.
+    image_caption = (
+        f"Оракул достал карту «{card_title}».\n"
+        "Полное послание — следующим сообщением."
+    )
     image_path = _card_image_path(gate_number)
     if image_path:
         try:
             with image_path.open("rb") as image_file:
                 await message_obj.reply_photo(
                     photo=image_file,
+                    caption=image_caption,
+                    parse_mode=None,
+                    reply_markup=ORACLE_LINE_KEYBOARD,
                     connect_timeout=20,
                     read_timeout=60,
                     write_timeout=60,
@@ -2336,12 +2347,12 @@ async def send_oracle_card(message_obj, uid: int):
             print(f"WARN oracle image gate={gate_number}: {exc}")
     # Картинка и чтение — две независимые доставки. Ошибка форматирования или
     # временный сетевой сбой после upload не должны оставлять пользователя с
-    # одной немой картой. Тексты библиотеки отправляем как plain text.
+    # одной немой картой: под изображением уже есть заголовок и кнопки 1–6.
+    # Тексты библиотеки отправляем как plain text.
     await asyncio.sleep(0.25)
     await safe_send(
         message_obj,
         oracle_message,
-        reply_markup=ORACLE_LINE_KEYBOARD,
         parse_mode=None,
     )
 
@@ -2359,6 +2370,7 @@ async def send_oracle_line(message_obj, uid: int, line_number: int):
         message_obj,
         _oracle_line_message(source, line_number, str(users.get(uid, {}).get("oracle_question", ""))),
         reply_markup=ORACLE_RESULT_KEYBOARD,
+        parse_mode=None,
     )
 
 async def send_menu(update: Update):
