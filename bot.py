@@ -78,6 +78,9 @@ PRIVACY_CONTACT = os.environ.get("PRIVACY_CONTACT", "@danilkina")
 # пробного доступа, но не блокируется внезапно. Для запуска paywall на Railway
 # достаточно выставить TRIAL_ENFORCED=1.
 TRIAL_ENFORCED = os.environ.get("TRIAL_ENFORCED", "0").lower() in {"1", "true", "yes", "on"}
+ACTIVE_RAILWAY_PROJECT_ID = os.environ.get(
+    "ACTIVE_RAILWAY_PROJECT_ID", "9b74e8cc-9d3c-403e-8c31-92d944ad5e1a"
+)
 PREMIUM_USER_IDS = {
     int(value.strip()) for value in os.environ.get("PREMIUM_USER_IDS", "").split(",")
     if value.strip().isdigit()
@@ -3139,6 +3142,20 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def telegram_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Не оставляет нажатую кнопку без ответа при неожиданной ошибке."""
+    print(f"ERROR unhandled Telegram update: {ctx.error}", flush=True)
+    try:
+        message = getattr(update, "effective_message", None)
+        if message:
+            await message.reply_text(
+                "Я получила действие, но не смогла закончить расчёт. "
+                "Попробуй ещё раз через минуту или начни с /start."
+            )
+    except Exception as exc:
+        print(f"ERROR sending Telegram fallback: {exc}", flush=True)
+
+
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -3146,10 +3163,13 @@ def main():
     # Telegram long polling допускает только один активный экземпляр бота, поэтому
     # второй проект должен завершиться до обращения к Telegram API.
     railway_project = os.environ.get("RAILWAY_PROJECT_NAME", "").strip()
-    if railway_project and railway_project != "hearty-stillness":
+    railway_project_id = os.environ.get("RAILWAY_PROJECT_ID", "").strip()
+    wrong_named_project = railway_project and railway_project != "hearty-stillness"
+    wrong_project_id = railway_project_id and railway_project_id != ACTIVE_RAILWAY_PROJECT_ID
+    if wrong_named_project or wrong_project_id:
         print(
             "Bot startup skipped: this repository is active only in "
-            f"hearty-stillness (current project: {railway_project})."
+            f"hearty-stillness (current project: {railway_project or railway_project_id})."
         )
         return
 
@@ -3163,6 +3183,7 @@ def main():
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_error_handler(telegram_error_handler)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
