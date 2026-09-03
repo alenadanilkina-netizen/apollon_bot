@@ -35,6 +35,7 @@ async def main() -> None:
     original_ask = bot.ask_claude
     original_send = bot.safe_send
     original_transits = bot.collect_transit_snapshots
+    original_save_consent = bot.db_save_consent
     captured = []
 
     async def failing_ask(*_args, **_kwargs):
@@ -60,10 +61,27 @@ async def main() -> None:
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
         assert captured and "базовую навигацию" in captured[-1][0]
         assert captured[-1][1]["reply_markup"] is bot.FORECAST_KEYBOARD
+
+        # Пока два документа не открыты, кнопки согласия в интерфейсе нет.
+        bot.users[uid] = {"history": []}
+        keyboard = bot.personal_data_documents_keyboard(uid)
+        assert all(button.callback_data != "personal_consent_yes" for row in keyboard.inline_keyboard for button in row)
+        bot.db_save_consent = lambda *_args: None
+        query = FakeQuery(uid, "privacy_policy")
+        await bot.handle_consent(SimpleNamespace(callback_query=query), None)
+        query = FakeQuery(uid, "personal_data_consent")
+        await bot.handle_consent(SimpleNamespace(callback_query=query), None)
+        keyboard = bot.personal_data_documents_keyboard(uid)
+        assert any(button.callback_data == "personal_consent_yes" for row in keyboard.inline_keyboard for button in row)
+        query = FakeQuery(uid, "personal_consent_yes")
+        result = await bot.handle_consent(SimpleNamespace(callback_query=query), None)
+        assert result == bot.ASK_BIRTH
+        assert bot.users[uid]["consent"] is True
     finally:
         bot.ask_claude = original_ask
         bot.safe_send = original_send
         bot.collect_transit_snapshots = original_transits
+        bot.db_save_consent = original_save_consent
         bot.users.pop(uid, None)
 
     print("OK: personal blocks and forecasts return a readable fallback after external failure")

@@ -69,7 +69,7 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
 # Пользователь не должен ждать минутами, пока сторонний текстовый сервис
 # молчит. После короткого таймаута выдаём базовый разбор по уже рассчитанной
 # карте, а не оставляем экран на фразе «Смотрю в карту…».
-AI_RESPONSE_TIMEOUT_SECONDS = min(int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "35")), 40)
+AI_RESPONSE_TIMEOUT_SECONDS = min(int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "12")), 15)
 PRIVACY_POLICY_VERSION = "2026-08-25"
 # Перед публичным запуском эти реквизиты нужно заменить на фактические данные
 # оператора в Railway Variables. Не скрываем инфраструктуру за обещанием
@@ -257,32 +257,6 @@ def trial_status(uid: int) -> tuple[datetime, int, bool]:
     remaining_seconds = max(0, int((expires - datetime.now()).total_seconds()))
     remaining_hours = (remaining_seconds + 3599) // 3600
     return started, remaining_hours, remaining_seconds <= 0
-
-
-def trial_banner(uid: int) -> str:
-    """Коротко сообщает срок доступа, не превращая каждый ответ в рекламу."""
-    _, hours_left, expired = trial_status(uid)
-    if expired:
-        return "Пробный доступ на 3 дня завершён."
-    days = hours_left // 24
-    hours = hours_left % 24
-    if days:
-        left = f"{days} дн. {hours} ч." if hours else f"{days} дн."
-    else:
-        left = f"{hours} ч."
-    return f"Бесплатный доступ: осталось {left}."
-
-
-def olympus_day_message(uid: int) -> str:
-    """Короткая последовательность бесплатного входа без жёсткого paywall."""
-    started, _, _ = trial_status(uid)
-    day = max(1, min(3, (datetime.now() - started).days + 1))
-    messages = {
-        1: "Сегодня открыта первая дверь: выясним, зачем тебя пригласили на Олимп.",
-        2: "Сегодня совет обсуждает твоё противоречие. Обычно именно там прячется полезная правда.",
-        3: "Сегодня можно собрать первые аргументы для своей кампании: за что тебя действительно выберут.",
-    }
-    return messages[day]
 
 
 def trial_blocked_message(uid: int) -> str:
@@ -1075,11 +1049,8 @@ async def _finish_birth_calculation(update: Update, uid: int) -> int:
             f"{name}, личная карта собрана.\n\n"
             "В ней несколько оптик: как ты принимаешь решения, где проявляешь силу, "
             "что ищешь в близости и какой период сейчас проживаешь. Откроем их по одной — "
-            "иначе получится не карта, а стенограмма собрания богов.\n\n"
-            "Неподвижную звезду добавим, когда утвердим каталог и трактовки. "
-            "Назначать её на глаз было бы красиво, но неточно."
+            "иначе получится не карта, а стенограмма собрания богов."
         )
-        await update.message.reply_text(trial_banner(uid))
         await update.message.reply_text("Олимп готов. Выбирай, с какой части себя начнём.",
                                         reply_markup=olympus_menu_keyboard(uid))
         users[uid]["menu_shown"] = True
@@ -2556,11 +2527,41 @@ def get_forecast_prompt(period: str, transits_data: str) -> str:
 ДАННЫЕ СРЕЗОВ:
 {transits_data}"""
 
+
+def personal_data_documents_keyboard(uid: int) -> InlineKeyboardMarkup:
+    """Два документа и отдельное подтверждение согласия после ознакомления."""
+    user = users.get(uid, {})
+    rows = [
+        [InlineKeyboardButton("📜 Политика конфиденциальности", callback_data="privacy_policy")],
+        [InlineKeyboardButton("📝 Согласие на обработку персональных данных", callback_data="personal_data_consent")],
+    ]
+    if user.get("privacy_policy_seen") and user.get("personal_data_consent_seen"):
+        rows.append([InlineKeyboardButton("✅ Даю согласие на обработку данных", callback_data="personal_consent_yes")])
+    rows.append([InlineKeyboardButton("← Вернуться к Оракулу", callback_data="personal_consent_no")])
+    return InlineKeyboardMarkup(rows)
+
+
+def personal_data_documents_status(uid: int) -> str:
+    user = users.get(uid, {})
+    read = []
+    if user.get("privacy_policy_seen"):
+        read.append("политика конфиденциальности")
+    if user.get("personal_data_consent_seen"):
+        read.append("согласие на обработку персональных данных")
+    if len(read) == 2:
+        return "С обоими документами можно ознакомиться выше. Теперь подтверди согласие отдельной кнопкой."
+    if read:
+        return f"Открыт документ: {read[0]}. Прочитай второй документ, затем появится кнопка согласия."
+    return "Открой оба документа. После этого появится отдельная кнопка согласия."
+
+
 async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
+    user = users.setdefault(uid, {"history": []})
     if query.data == "privacy_policy":
+        user["privacy_policy_seen"] = True
         await query.message.reply_text(
             f"Политика конфиденциальности (версия {PRIVACY_POLICY_VERSION})\n\n"
             f"Оператор: {PRIVACY_OPERATOR_NAME}. Контакт по вопросам данных: {PRIVACY_CONTACT}.\n\n"
@@ -2573,12 +2574,35 @@ async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "подключённому ИИ-провайдеру только для формирования ответа.\n\n"
             "Срок: до удаления по запросу пользователя или прекращения работы бота. Чтобы отозвать согласие "
             "и удалить сохранённую карту, используй команду /delete_my_data или напиши оператору: " + PRIVACY_CONTACT + ".\n\n"
-            "Продолжая, ты можешь вернуться к согласию ниже."
+            + personal_data_documents_status(uid),
+            reply_markup=personal_data_documents_keyboard(uid),
+        )
+        return ASK_CONSENT
+
+    if query.data == "personal_data_consent":
+        user["personal_data_consent_seen"] = True
+        await query.message.reply_text(
+            "Согласие на обработку персональных данных\n\n"
+            f"Я подтверждаю, что добровольно передаю оператору {PRIVACY_OPERATOR_NAME} данные, "
+            "которые введу в боте: дату, время и место рождения, Telegram ID, имя или ник и сообщения.\n\n"
+            "Цель обработки: построение и сохранение личной карты, повторный доступ к ней и ответы бота на мои запросы. "
+            "С данными могут выполняться сбор, запись, хранение, уточнение, использование и удаление — только для этих целей.\n\n"
+            "Согласие действует до его отзыва. Я могу отозвать его и запросить удаление данных командой /delete_my_data "
+            f"или через {PRIVACY_CONTACT}.\n\n"
+            + personal_data_documents_status(uid),
+            reply_markup=personal_data_documents_keyboard(uid),
         )
         return ASK_CONSENT
 
     if query.data in {"consent_yes", "personal_consent_yes"}:
-        user = users.setdefault(uid, {"history": []})
+        if query.data == "personal_consent_yes" and not (
+            user.get("privacy_policy_seen") and user.get("personal_data_consent_seen")
+        ):
+            await query.message.reply_text(
+                "Перед согласием нужно открыть два документа: политику конфиденциальности и согласие на обработку персональных данных.",
+                reply_markup=personal_data_documents_keyboard(uid),
+            )
+            return ASK_CONSENT
         user["consent"] = True
         user["consent_at"] = datetime.now().isoformat()
         db_save_consent(uid, user["consent_at"])
@@ -2710,20 +2734,15 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ASK_QUESTION
 
     if query.data == "oracle_to_olympus":
-        consent_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📜 Открыть политику конфиденциальности", callback_data="privacy_policy")],
-            [InlineKeyboardButton("✅ Я прочитала и согласна", callback_data="personal_consent_yes")],
-            [InlineKeyboardButton("← Вернуться к Оракулу", callback_data="personal_consent_no")],
-        ])
+        users.setdefault(uid, {}).pop("privacy_policy_seen", None)
+        users.setdefault(uid, {}).pop("personal_data_consent_seen", None)
         await query.message.reply_text(
             "Совет дошёл до части церемонии, которую даже Зевс не имеет права пропустить.\n\n"
             "Чтобы построить твою личную карту, понадобятся дата, точное время и место рождения. "
-            "Это персональные данные. Я использую их только для расчёта и сохранения твоей карты, "
-            "чтобы ты могла вернуться к ней позже.\n\n"
-            "Сообщения проходят через Telegram, техническая база бота размещена на Railway. "
-            "Если включается ИИ-разбор, текст запроса передаётся подключённому ИИ-провайдеру только для подготовки ответа.\n\n"
-            "Сначала открой политику, затем подтверди согласие отдельной кнопкой. Оракул доступен и без личной карты.",
-            reply_markup=consent_kb,
+            "Это персональные данные. Перед вводом ознакомься с двумя документами ниже: "
+            "политикой конфиденциальности и согласием на обработку персональных данных.\n\n"
+            "После прочтения обоих документов появится отдельная кнопка, которой ты подтвердишь согласие.",
+            reply_markup=personal_data_documents_keyboard(uid),
         )
         return ASK_CONSENT
 
@@ -2905,7 +2924,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Если один из источников эфемерид завис, ниже сработает понятный
             # резервный прогноз.
             transits_str = await asyncio.wait_for(
-                collect_transit_snapshots(query.data, birth, today), timeout=45
+                collect_transit_snapshots(query.data, birth, today), timeout=15
             )
 
             extra_str = ""
