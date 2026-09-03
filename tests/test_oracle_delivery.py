@@ -32,15 +32,14 @@ async def main() -> None:
 
     assert message.photo_calls == 1
     photo_kwargs = message.photo_kwargs[0]
-    assert photo_kwargs["reply_markup"] is bot.ORACLE_LINE_KEYBOARD
-    assert photo_kwargs["parse_mode"] is None
-    assert "Оракул достал карту" in photo_kwargs["caption"]
+    assert "reply_markup" not in photo_kwargs
+    assert "caption" not in photo_kwargs
     assert message.text_attempts == 2
     assert len(message.delivered) == 1
     text, kwargs = message.delivered[0]
     assert len(text) >= 800
     assert kwargs["parse_mode"] is None
-    assert kwargs["reply_markup"] is None
+    assert kwargs["reply_markup"] is bot.ORACLE_LINE_KEYBOARD
     assert bot.users[uid].get("current_card_gate") in range(1, 65)
     print("OK: photo delivered, transient text failure retried, interpretation and 1-6 buttons delivered")
 

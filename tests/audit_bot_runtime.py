@@ -85,6 +85,10 @@ def main() -> None:
     assert birth == {"day": 23, "month": 2, "year": 1981, "hour": 9, "minute": 50}
     assert place == "Суленцин, Польша"
 
+    assert bot._public_text_has_technical_leak("В 53-х воротах происходит давление.")
+    assert bot._public_text_has_technical_leak("Венера в экзальтации обещает успех.")
+    assert not bot._public_text_has_technical_leak("Новый этап стоит начинать, когда есть силы продолжать путь.")
+
     callbacks = _literal_callbacks()
     generic_blocks = set(bot.BLOCK_PROMPTS)
     source_text = (ROOT / "bot.py").read_text(encoding="utf-8")

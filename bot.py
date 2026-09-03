@@ -66,7 +66,10 @@ AI_PROVIDER_ORDER = [
 ]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
-AI_RESPONSE_TIMEOUT_SECONDS = int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "90"))
+# Пользователь не должен ждать минутами, пока сторонний текстовый сервис
+# молчит. После короткого таймаута выдаём базовый разбор по уже рассчитанной
+# карте, а не оставляем экран на фразе «Смотрю в карту…».
+AI_RESPONSE_TIMEOUT_SECONDS = min(int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "35")), 40)
 PRIVACY_POLICY_VERSION = "2026-08-25"
 # Перед публичным запуском эти реквизиты нужно заменить на фактические данные
 # оператора в Railway Variables. Не скрываем инфраструктуру за обещанием
@@ -704,6 +707,12 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
                 continue
 
             if reply.strip():
+                # Системная инструкция для модели — не единственная защита.
+                # Старые библиотечные формулировки иногда буквально повторялись
+                # в ответе. Такой ответ не показываем: следующий провайдер или
+                # резервный разбор дадут понятный текст без учебного жаргона.
+                if _public_text_has_technical_leak(reply):
+                    raise RuntimeError("technical terminology leaked into public reply")
                 print(f"AI provider succeeded: {provider}", flush=True)
                 break
             raise RuntimeError("empty response")
@@ -731,6 +740,85 @@ async def ask_claude(user_id: int, message: str) -> str:
 
 # Единое имя для новых обработчиков; старые сценарии сохраняют совместимость.
 ask_ai = ask_claude
+
+
+def _hd_label(raw: str, marker: str) -> str:
+    match = re.search(rf"^{re.escape(marker)}:\s*(.+)$", raw, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def fallback_block_reading(uid: int, block: str) -> str:
+    """Понятный резервный разбор, если внешний AI временно недоступен."""
+    user = users.get(uid, {})
+    name = user.get("name") or "Ты"
+    hd_raw = str(user.get("hd", {}).get("raw", ""))
+    type_text = _hd_label(hd_raw, "ТИП")
+    authority = _hd_label(hd_raw, "АВТОРИТЕТ")
+    type_hint = (
+        "Твоя сила не в постоянном рывке, а в точном видении людей и ситуаций; "
+        "лучше всего она включается, когда к тебе действительно обращаются."
+        if "Проектор" in type_text else
+        "Твоя сила заметнее всего там, где действие даёт телесный отклик, а не только кажется правильным головой."
+    )
+    decision_hint = (
+        "С важными решениями полезно дать себе время: ясность приходит не на эмоциональном пике, а после него."
+        if "Эмоцион" in authority else
+        "С важными решениями сверяйся с прямым ощущением: есть ли у тебя на это настоящее внутреннее «да»."
+    )
+    block_texts = {
+        "block_identity": (
+            "Твой характер проявляется не в постоянной демонстрации силы, а в способности заметить суть и назвать её точно. "
+            "Там, где другие торопятся, ты можешь увидеть устройство ситуации и предложить более ясный ход."
+        ),
+        "block_mission": (
+            "Твоё дело раскрывается там, где нужно соединить наблюдательность, смысл и практическое решение. "
+            "Выбирай задачи, в которых твой взгляд меняет не только настроение, но и сам способ действовать."
+        ),
+        "block_potential": (
+            "Твой потенциал растёт, когда внимательность превращается в действие. Риск появляется там, где ты слишком долго готовишься, "
+            "объясняешь или берёшь на себя чужую ответственность вместо того, чтобы обозначить собственную границу."
+        ),
+        "block_love": (
+            "В близости тебе важны честный разговор и чувство, что тебя действительно видят. "
+            "Не соглашайся на отношения, где приходится угадывать правила или заслуживать право на внимание."
+        ),
+        "block_money": (
+            "Деньги лучше приходят туда, где ты называешь ценность своей работы и заранее обсуждаешь условия. "
+            "Смотри не только на сумму, но и на обмен: остаются ли у тебя силы после того, как ты выполнила обещанное."
+        ),
+        "block_health": (
+            "Тело полезно слышать раньше, чем оно вынуждено повышать голос. Режим становится устойчивее, когда в нём есть паузы, "
+            "сон и выполнимые границы, а не попытка компенсировать усталость силой воли."
+        ),
+        "block_resources": (
+            "Восстановление начинается с того, чтобы убрать лишние сигналы и вернуть себе среду, в которой можно думать и чувствовать без постоянной обороны. "
+            "Выбирай один небольшой ритуал, который реально повторишь на этой неделе."
+        ),
+    }
+    topic = block_texts.get(block, "Сейчас полезно вернуть внимание к тому, что действительно зависит от тебя.")
+    return (
+        f"{name}, даю базовый разбор по уже построенной карте.\n\n"
+        f"{type_hint}\n\n{decision_hint}\n\n{topic}\n\n"
+        "Это не заменяет развёрнутую интерпретацию: внешний текстовый слой сейчас не ответил вовремя. "
+        "Но сам расчёт карты сохранён, и этот вывод построен на нём."
+    )
+
+
+def fallback_forecast_reading(uid: int, horizon: str) -> str:
+    labels = {
+        "forecast_day": "на сегодня",
+        "forecast_month": "на ближайший месяц",
+        "forecast_3months": "на ближайшие три месяца",
+        "forecast_year": "на годовой период",
+    }
+    period = labels.get(horizon, "на текущий период")
+    return (
+        f"Даю базовую навигацию {period}.\n\n"
+        "Не принимай крупных решений из ощущения срочности. Сначала проверь, что уже требует завершения, "
+        "какой разговор нельзя откладывать и где твоё время уходит без ясного обмена.\n\n"
+        "Выбери один наблюдаемый шаг на этот период: закрыть обязательство, уточнить условия или освободить место для действительно важного дела. "
+        "Развёрнутый слой прогноза временно не ответил, но твоя личная карта сохранена."
+    )
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
 
@@ -2033,12 +2121,12 @@ ORACLE_CARD_PROFILES: dict[int, tuple[str, str, str, str]] = {
 
 
 ORACLE_LINE_FRAMES: dict[int, tuple[str, str]] = {
-    1: ("Основание", "Сначала найди факт, опору или правило, без которого этот вопрос превращается в догадку."),
-    2: ("Естественный ход", "Обрати внимание на то, что получается без насилия над собой: там часто скрыт самый практичный способ действовать."),
-    3: ("Проверка опытом", "Разреши себе небольшой эксперимент. Ошибка здесь не провал, а данные о том, как эта ситуация устроена на самом деле."),
-    4: ("Контакт", "Посмотри, что меняется в разговоре с другими: ясность часто появляется не в одиночестве, а в точном обмене."),
-    5: ("Ответственность", "Сформулируй обещание так, чтобы его можно было выполнить. Люди особенно внимательно слушают там, где видят последствия твоих слов."),
-    6: ("Дальняя перспектива", "Сделай шаг назад и оцени не сегодняшний импульс, а то, какую историю этот выбор создаст через несколько месяцев."),
+    1: ("На что опереться", "Сначала найди факт, опору или правило, без которого этот вопрос превращается в догадку."),
+    2: ("Где не нужно себя ломать", "Обрати внимание на то, что получается без насилия над собой: там часто скрыт самый практичный способ действовать."),
+    3: ("Что проверить делом", "Разреши себе небольшой эксперимент. Ошибка здесь не провал, а данные о том, как эта ситуация устроена на самом деле."),
+    4: ("С кем поговорить", "Посмотри, что меняется в разговоре с другими: ясность часто появляется не в одиночестве, а в точном обмене."),
+    5: ("За что отвечать", "Сформулируй обещание так, чтобы его можно было выполнить. Люди особенно внимательно слушают там, где видят последствия твоих слов."),
+    6: ("К чему ведёт выбор", "Сделай шаг назад и оцени не сегодняшний импульс, а то, какую историю этот выбор создаст через несколько месяцев."),
 }
 
 
@@ -2136,6 +2224,23 @@ _ORACLE_TECHNICAL_RE = re.compile(
     r"\bу\s+(?:первой|второй|третьей|четв[её]ртой|пятой|шестой)\s+линии\b)",
     re.IGNORECASE,
 )
+
+
+# Это не редактор текста, а стоп-кран перед отправкой. Если модель вопреки
+# инструкции снова пишет «53-е ворота» или «Венера в экзальтации», пользователю
+# не уйдёт обрывочный учебный фрагмент: сработает следующий провайдер либо
+# понятный резервный разбор.
+_PUBLIC_TECHNICAL_LEAK_RE = re.compile(
+    r"(?:\bворот\w*\s*[-—–]?\s*\d{1,2}\b|\b\d{1,2}(?:[-‑–—]?(?:е|х))?\s+ворот\w*|"
+    r"\b(?:g[-‑–— ]?центр|сакральн\w*\s+центр|корнев\w*\s+центр|"
+    r"эмоциональн\w*\s+центр|канал\s+\d|бодиграф|рейв[- ]?карт|"
+    r"дизайн\w*\s+человек|экзальтац\w*|планет\w*\s+в\s+(?:ущербе|падении))\b)",
+    re.IGNORECASE,
+)
+
+
+def _public_text_has_technical_leak(value: str) -> bool:
+    return bool(_PUBLIC_TECHNICAL_LEAK_RE.search(str(value or "")))
 
 
 def _oracle_library_sentences(value: str, limit: int = 3000) -> list[str]:
@@ -2266,22 +2371,23 @@ def _oracle_question_focus(question: str) -> str:
 
 
 def _oracle_card_message(source: dict, question: str = "") -> str:
-    """Полное первое чтение: смысл карты из библиотеки плюс применение."""
+    """Первое чтение только человеческим языком, без учебной терминологии."""
     gate = int(source.get("gate") or 0)
     title, theme, insight, caution = ORACLE_CARD_PROFILES.get(
         gate,
         ("Наблюдение", "вопросе, который требует внимательного взгляда", "Сделай паузу и отдели факты от предположений.", "Не торопись с окончательным выводом."),
     )
-    source_text = _join_oracle_sentences(
-        _oracle_library_sentences(source.get("oracle_full", ""), limit=2700)
-    )
-    source_block = f"{source_text}\n\n" if source_text else ""
     message = (
         f"Оракул достал карту «{title}».\n\n"
         f"Эта карта — о {theme}.\n\n"
-        f"{source_block}"
         f"{insight}\n\n"
         f"{caution}\n\n"
+        f"В повседневной жизни эта тема редко выглядит как громкое событие. "
+        f"Чаще она проявляется в маленьком выборе: чему дать место, от чего отказаться "
+        f"и где перестать действовать по привычке. Не спеши делать общий вывод — "
+        f"сначала найди один конкретный эпизод, в котором «{title.lower()}» уже происходит.\n\n"
+        "Полезный ориентир здесь — не обещание себе, а след в реальности: "
+        "разговор, решение, выполненная договорённость или освобождённое место в расписании.\n\n"
         f"{_oracle_question_focus(question)}\n\n"
         "Теперь выбери число. Не ищи правильное — выбери то, которое первым задержало взгляд."
     )
@@ -2289,23 +2395,20 @@ def _oracle_card_message(source: dict, question: str = "") -> str:
 
 
 def _oracle_line_message(source: dict, line_number: int, question: str = "") -> str:
-    """Второе чтение: отдельный полный текст выбранной линии без повтора карты."""
+    """Второе чтение: отдельный чистый текст выбранной линии."""
     gate = int(source.get("gate") or 0)
     card_title, _theme, _insight, _caution = ORACLE_CARD_PROFILES.get(
         gate,
         ("Наблюдение", "вопросе, который требует внимательного взгляда", "Сделай паузу и отдели факты от предположений.", "Не торопись с окончательным выводом."),
     )
     line_title, frame = ORACLE_LINE_FRAMES.get(line_number, ("Угол карты", "Посмотри на ситуацию чуть внимательнее."))
-    line_source = _join_oracle_sentences(
-        _oracle_library_sentences(source.get("lines", {}).get(line_number, ""), limit=2900)
-    )
-    if not line_source:
-        line_source = frame
     application = ORACLE_LINE_APPLICATIONS.get(line_number, "")
     message = (
         f"Ты выбрала «{line_title}».\n\n"
         f"У карты «{card_title}» эта грань раскрывается так: {frame}\n\n"
-        f"{line_source}\n\n"
+        f"Не пытайся решить всё сразу. Эта линия предлагает увидеть один наблюдаемый "
+        f"шаг: что можно проверить, назвать или изменить в ближайшем разговоре либо действии. "
+        f"Так карта становится не красивой мыслью, а способом посмотреть на свою ситуацию точнее.\n\n"
         f"{application}\n\n"
         "Вернись к своему вопросу и проверь, где эта ситуация уже проявилась: "
         "в твоих действиях, договорённостях или реакции другого человека."
@@ -2324,23 +2427,12 @@ async def send_oracle_card(message_obj, uid: int):
     users[uid]["current_card_gate"] = gate_number
     question = str(users.get(uid, {}).get("oracle_question", ""))
     oracle_message = _oracle_card_message(source, question)
-    card_title = ORACLE_CARD_PROFILES.get(gate_number, ("Послание",))[0]
-    # Подпись и выбор линии отправляем вместе с изображением. Это оставляет
-    # человеку рабочую карту даже в редком случае, когда следующий большой
-    # текст Telegram доставляет с задержкой или временно отклоняет.
-    image_caption = (
-        f"Оракул достал карту «{card_title}».\n"
-        "Полное послание — следующим сообщением."
-    )
     image_path = _card_image_path(gate_number)
     if image_path:
         try:
             with image_path.open("rb") as image_file:
                 await message_obj.reply_photo(
                     photo=image_file,
-                    caption=image_caption,
-                    parse_mode=None,
-                    reply_markup=ORACLE_LINE_KEYBOARD,
                     connect_timeout=20,
                     read_timeout=60,
                     write_timeout=60,
@@ -2350,12 +2442,13 @@ async def send_oracle_card(message_obj, uid: int):
             print(f"WARN oracle image gate={gate_number}: {exc}")
     # Картинка и чтение — две независимые доставки. Ошибка форматирования или
     # временный сетевой сбой после upload не должны оставлять пользователя с
-    # одной немой картой: под изображением уже есть заголовок и кнопки 1–6.
-    # Тексты библиотеки отправляем как plain text.
+    # одной немой картой. Текст и кнопки намеренно приходят после картинки:
+    # сначала читается послание, затем выбирается одна из шести граней.
     await asyncio.sleep(0.25)
     await safe_send(
         message_obj,
         oracle_message,
+        reply_markup=ORACLE_LINE_KEYBOARD,
         parse_mode=None,
     )
 
@@ -2808,7 +2901,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         today = datetime.now()
         await query.message.reply_text("Смотрю, что происходит на небе...")
         try:
-            transits_str = await collect_transit_snapshots(query.data, birth, today)
+            # Расчёт не имеет права молча держать пользователя на заставке.
+            # Если один из источников эфемерид завис, ниже сработает понятный
+            # резервный прогноз.
+            transits_str = await asyncio.wait_for(
+                collect_transit_snapshots(query.data, birth, today), timeout=45
+            )
 
             extra_str = ""
             if query.data == "forecast_year":
@@ -2856,13 +2954,21 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await safe_send(query.message, reply)
         except asyncio.TimeoutError:
             print("ERROR forecast: AI response timeout", flush=True)
-            await query.message.reply_text(
-                "Оракул задержался дольше обычного. Попробуй этот прогноз ещё раз через минуту."
+            await safe_send(
+                query.message,
+                fallback_forecast_reading(uid, query.data),
+                reply_markup=FORECAST_KEYBOARD,
+                parse_mode=None,
             )
             return CHAT
         except Exception as exc:
             print(f"ERROR forecast: {type(exc).__name__}: {exc}", flush=True)
-            await query.message.reply_text("Не удалось получить прогноз сейчас. Попробуй ещё раз через минуту.")
+            await safe_send(
+                query.message,
+                fallback_forecast_reading(uid, query.data),
+                reply_markup=FORECAST_KEYBOARD,
+                parse_mode=None,
+            )
             return CHAT
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
         return CHAT
@@ -2878,21 +2984,8 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = users[uid].get("name", "")
     full_prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{prompt}"
 
-    # Для блока призвания добавляем контекст Креста воплощения
-    if query.data == "block_mission" and uid in users:
-        hd = users[uid].get("hd", {})
-        if hd:
-            cross_ctx = get_cross_context(hd)
-            if cross_ctx:
-                full_prompt += f"\n\nКРЕСТ ВОПЛОЩЕНИЯ (описания из HD библиотеки):\n{cross_ctx}"
-
-    # Для блока отношений добавляем ворота любви из Love Book
-    if query.data == "block_love" and uid in users:
-        hd = users[uid].get("hd", {})
-        if hd:
-            love_ctx = get_love_context(hd)
-            if love_ctx:
-                full_prompt += f"\n\nВОРОТА ЛЮБВИ (из Love Book Ra Uru Hu):\n{love_ctx}"
+    # Сырые фрагменты учебной библиотеки не добавляем в публичный промпт.
+    # Они были источником «ворот», повторов и обрывов в ответах модели.
 
     try:
         await query.message.reply_text("Смотрю в карту...")
@@ -2908,23 +3001,16 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         import traceback
         print(f"ERROR in handle_button: {traceback.format_exc()}")
-        error_text = str(e).lower()
-        if any(marker in error_text for marker in ("credit balance", "billing", "insufficient_quota", "api key")):
-            message = (
-                "Этот зал пока не может говорить: у подключённого ИИ нет доступа к API. "
-                "Твоя карта сохранена — попробуй Оракула или вернись сюда после пополнения баланса."
-            )
-        else:
-            message = (
-                "Этот зал не открылся с первого раза. Карта сохранена. "
-                "Попробуй повторить действие через минуту или вернись на Олимп."
-            )
-        await query.message.reply_text(
-            message,
+        # Даже при недоступности внешнего текстового сервиса пользователь
+        # получает разбор и может продолжить путь, а не остаётся у «Смотрю…».
+        await safe_send(
+            query.message,
+            fallback_block_reading(uid, query.data),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↻ Повторить", callback_data=query.data)],
                 [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
             ]),
+            parse_mode=None,
         )
         return CHAT
     await query.message.reply_text(olympus_hub_message(uid), reply_markup=olympus_menu_keyboard(uid))
