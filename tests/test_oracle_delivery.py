@@ -1,4 +1,4 @@
-"""Regression test: a card image must always be followed by text and line buttons."""
+"""Regression test: card, full Oracle reading and line buttons arrive as one update."""
 
 import asyncio
 
@@ -10,7 +10,6 @@ class FakeMessage:
         self.photo_calls = 0
         self.photo_kwargs = []
         self.text_attempts = 0
-        self.delivered = []
 
     async def reply_photo(self, **kwargs):
         self.photo_calls += 1
@@ -18,9 +17,6 @@ class FakeMessage:
 
     async def reply_text(self, text, **kwargs):
         self.text_attempts += 1
-        if self.text_attempts == 1:
-            raise RuntimeError("temporary Telegram connection failure")
-        self.delivered.append((text, kwargs))
 
 
 async def main() -> None:
@@ -32,16 +28,15 @@ async def main() -> None:
 
     assert message.photo_calls == 1
     photo_kwargs = message.photo_kwargs[0]
-    assert "reply_markup" not in photo_kwargs
-    assert "caption" not in photo_kwargs
-    assert message.text_attempts == 2
-    assert len(message.delivered) == 1
-    text, kwargs = message.delivered[0]
+    assert "caption" in photo_kwargs
+    text = photo_kwargs["caption"]
     assert len(text) >= 800
-    assert kwargs["parse_mode"] is None
-    assert kwargs["reply_markup"] is bot.ORACLE_LINE_KEYBOARD
+    assert len(text) <= 1024
+    assert photo_kwargs["parse_mode"] is None
+    assert photo_kwargs["reply_markup"] is bot.ORACLE_LINE_KEYBOARD
+    assert message.text_attempts == 0
     assert bot.users[uid].get("current_card_gate") in range(1, 65)
-    print("OK: photo delivered, transient text failure retried, interpretation and 1-6 buttons delivered")
+    print("OK: card caption contains the full interpretation and 1-6 buttons")
 
 
 if __name__ == "__main__":

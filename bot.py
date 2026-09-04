@@ -2398,12 +2398,21 @@ async def send_oracle_card(message_obj, uid: int):
     users[uid]["current_card_gate"] = gate_number
     question = str(users.get(uid, {}).get("oracle_question", ""))
     oracle_message = _oracle_card_message(source, question)
+    # Telegram гарантированно показывает подпись вместе с уже отправленной
+    # картинкой. Это надёжнее, чем второй отдельный запрос сразу после upload:
+    # именно в нём пользователь иногда оставался с немой картой. Сообщение
+    # проверяется аудитом и всегда укладывается в лимит подписи Telegram.
+    if len(oracle_message) > 1024:
+        raise ValueError(f"Oracle caption is too long: {len(oracle_message)} characters")
     image_path = _card_image_path(gate_number)
     if image_path:
         try:
             with image_path.open("rb") as image_file:
                 await message_obj.reply_photo(
                     photo=image_file,
+                    caption=oracle_message,
+                    parse_mode=None,
+                    reply_markup=ORACLE_LINE_KEYBOARD,
                     connect_timeout=20,
                     read_timeout=60,
                     write_timeout=60,
@@ -2411,17 +2420,23 @@ async def send_oracle_card(message_obj, uid: int):
                 )
         except Exception as exc:
             print(f"WARN oracle image gate={gate_number}: {exc}")
-    # Картинка и чтение — две независимые доставки. Ошибка форматирования или
-    # временный сетевой сбой после upload не должны оставлять пользователя с
-    # одной немой картой. Текст и кнопки намеренно приходят после картинки:
-    # сначала читается послание, затем выбирается одна из шести граней.
-    await asyncio.sleep(0.25)
-    await safe_send(
-        message_obj,
-        oracle_message,
-        reply_markup=ORACLE_LINE_KEYBOARD,
-        parse_mode=None,
-    )
+            # Если изображение по какой-то причине не загрузилось, человек всё
+            # равно получает полное послание и выбор линии отдельным сообщением.
+            await safe_send(
+                message_obj,
+                oracle_message,
+                reply_markup=ORACLE_LINE_KEYBOARD,
+                parse_mode=None,
+            )
+    else:
+        # Не допускаем «тихой» ошибки при отсутствующем ассете: текст важнее
+        # декоративной иллюстрации и должен быть доставлен в любом случае.
+        await safe_send(
+            message_obj,
+            oracle_message,
+            reply_markup=ORACLE_LINE_KEYBOARD,
+            parse_mode=None,
+        )
 
 
 async def send_oracle_line(message_obj, uid: int, line_number: int):

@@ -64,6 +64,7 @@ def main() -> None:
         card = bot._oracle_card_message(source, "Что важно увидеть сейчас?")
         card_lengths.append(len(card))
         assert len(card) >= 800, f"gate {gate}: card is too short ({len(card)})"
+        assert len(card) <= 1024, f"gate {gate}: card does not fit Telegram caption ({len(card)})"
         assert not FORBIDDEN_VISIBLE_TERMS.search(card), f"gate {gate}: technical term leaked"
         assert card.rstrip().endswith((".", "!", "?", "…", "взгляд."))
 
