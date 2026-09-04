@@ -722,7 +722,7 @@ def _hd_label(raw: str, marker: str) -> str:
 
 
 def fallback_block_reading(uid: int, block: str) -> str:
-    """Понятный резервный разбор, если внешний AI временно недоступен."""
+    """Первый устойчивый разбор: он уходит сразу, независимо от внешнего AI."""
     user = users.get(uid, {})
     name = user.get("name") or "Ты"
     hd_raw = str(user.get("hd", {}).get("raw", ""))
@@ -771,10 +771,10 @@ def fallback_block_reading(uid: int, block: str) -> str:
     }
     topic = block_texts.get(block, "Сейчас полезно вернуть внимание к тому, что действительно зависит от тебя.")
     return (
-        f"{name}, даю базовый разбор по уже построенной карте.\n\n"
+        f"{name}, первый разбор по уже построенной карте.\n\n"
         f"{type_hint}\n\n{decision_hint}\n\n{topic}\n\n"
-        "Это не заменяет развёрнутую интерпретацию: внешний текстовый слой сейчас не ответил вовремя. "
-        "Но сам расчёт карты сохранён, и этот вывод построен на нём."
+        "Проверь этот вывод на ближайшей реальной ситуации: разговоре, выборе или договорённости. "
+        "Так карта становится не ярлыком, а способом точнее увидеть свой следующий шаг."
     )
 
 
@@ -787,11 +787,11 @@ def fallback_forecast_reading(uid: int, horizon: str) -> str:
     }
     period = labels.get(horizon, "на текущий период")
     return (
-        f"Даю базовую навигацию {period}.\n\n"
+        f"Первый ориентир {period}.\n\n"
         "Не принимай крупных решений из ощущения срочности. Сначала проверь, что уже требует завершения, "
         "какой разговор нельзя откладывать и где твоё время уходит без ясного обмена.\n\n"
         "Выбери один наблюдаемый шаг на этот период: закрыть обязательство, уточнить условия или освободить место для действительно важного дела. "
-        "Развёрнутый слой прогноза временно не ответил, но твоя личная карта сохранена."
+        "Это практическая навигация по уже построенной личной карте."
     )
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
@@ -2918,7 +2918,9 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("forecast_"):
         birth = users[uid].get("birth", {})
         today = datetime.now()
-        await query.message.reply_text("Смотрю, что происходит на небе...")
+        # Пользователь получает ориентир сразу. Внешние эфемериды и ИИ могут
+        # дополнить его ниже, но больше не являются условием первого ответа.
+        await safe_send(query.message, fallback_forecast_reading(uid, query.data), parse_mode=None)
         try:
             # Расчёт не имеет права молча держать пользователя на заставке.
             # Если один из источников эфемерид завис, ниже сработает понятный
@@ -2973,21 +2975,11 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await safe_send(query.message, reply)
         except asyncio.TimeoutError:
             print("ERROR forecast: AI response timeout", flush=True)
-            await safe_send(
-                query.message,
-                fallback_forecast_reading(uid, query.data),
-                reply_markup=FORECAST_KEYBOARD,
-                parse_mode=None,
-            )
+            await query.message.reply_text("Подробный слой прогноза сегодня не собрался.", reply_markup=FORECAST_KEYBOARD)
             return CHAT
         except Exception as exc:
             print(f"ERROR forecast: {type(exc).__name__}: {exc}", flush=True)
-            await safe_send(
-                query.message,
-                fallback_forecast_reading(uid, query.data),
-                reply_markup=FORECAST_KEYBOARD,
-                parse_mode=None,
-            )
+            await query.message.reply_text("Подробный слой прогноза сегодня не собрался.", reply_markup=FORECAST_KEYBOARD)
             return CHAT
         await query.message.reply_text("Что ещё?", reply_markup=FORECAST_KEYBOARD)
         return CHAT
@@ -3006,10 +2998,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Сырые фрагменты учебной библиотеки не добавляем в публичный промпт.
     # Они были источником «ворот», повторов и обрывов в ответах модели.
 
+    # Первый содержательный ответ уходит синхронно с нажатием. Даже если
+    # внешняя модель недоступна, кнопка не оставляет человека у заставки.
+    await safe_send(query.message, fallback_block_reading(uid, query.data), parse_mode=None)
     try:
-        await query.message.reply_text("Смотрю в карту...")
         reply = await ask_claude(uid, full_prompt)
-        await safe_send(query.message, reply)
+        await safe_send(query.message, f"Подробный взгляд на эту тему:\n\n{reply}")
         # Помечаем тему только после успешного ответа. Иначе текущий блок
         # попадал в «уже разобрано» ещё до чтения и модель сама себя просила
         # его не повторять.
@@ -3020,16 +3014,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         import traceback
         print(f"ERROR in handle_button: {traceback.format_exc()}")
-        # Даже при недоступности внешнего текстового сервиса пользователь
-        # получает разбор и может продолжить путь, а не остаётся у «Смотрю…».
-        await safe_send(
-            query.message,
-            fallback_block_reading(uid, query.data),
+        await query.message.reply_text(
+            "Подробный слой этого зала сегодня не собрался. Первый разбор уже выше.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↻ Повторить", callback_data=query.data)],
                 [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
             ]),
-            parse_mode=None,
         )
         return CHAT
     await query.message.reply_text(olympus_hub_message(uid), reply_markup=olympus_menu_keyboard(uid))

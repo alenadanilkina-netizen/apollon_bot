@@ -52,15 +52,17 @@ async def main() -> None:
         bot.safe_send = capture_send
         query = FakeQuery(uid, "block_identity")
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
-        assert captured and "базовый разбор" in captured[-1][0]
-        assert captured[-1][1]["parse_mode"] is None
+        assert captured and "первый разбор" in captured[0][0]
+        assert captured[0][1]["parse_mode"] is None
+        assert "Подробный слой" in query.message.replies[-1][0]
 
         captured.clear()
         bot.collect_transit_snapshots = failing_transits
         query = FakeQuery(uid, "forecast_month")
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
-        assert captured and "базовую навигацию" in captured[-1][0]
-        assert captured[-1][1]["reply_markup"] is bot.FORECAST_KEYBOARD
+        assert captured and "Первый ориентир" in captured[0][0]
+        assert captured[0][1]["parse_mode"] is None
+        assert query.message.replies[-1][1]["reply_markup"] is bot.FORECAST_KEYBOARD
 
         # Пока два документа не открыты, кнопки согласия в интерфейсе нет.
         bot.users[uid] = {"history": []}
