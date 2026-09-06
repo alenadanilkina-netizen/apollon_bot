@@ -1,4 +1,4 @@
-"""Regression test: public buttons always answer when an external layer fails."""
+"""Regression test: each public button gets its own reading or a relevant fallback."""
 
 import asyncio
 from types import SimpleNamespace
@@ -47,14 +47,30 @@ async def main() -> None:
     async def capture_send(_message, text, **kwargs):
         captured.append((text, kwargs))
 
+    async def successful_ask(_uid, prompt):
+        assert "ЛИНЗА БЛОКА: ПОТЕНЦИАЛ И СЛАБЫЕ СТОРОНЫ" in prompt
+        return "У тебя есть отдельный полный разбор потенциала."
+
     try:
+        # При нормальной связи не показываем универсальный шаблон: приходит
+        # именно методология выбранной кнопки и её отдельный полный ответ.
+        bot.ask_claude = successful_ask
+        bot.safe_send = capture_send
+        query = FakeQuery(uid, "block_potential")
+        await bot.handle_button(SimpleNamespace(callback_query=query), None)
+        assert query.message.replies[0][0] == bot.block_loading_message("block_potential")
+        assert captured and "У тебя есть отдельный полный разбор потенциала." in captured[0][0]
+        assert "краткий ориентир" not in captured[0][0]
+
+        captured.clear()
         bot.ask_claude = failing_ask
         bot.safe_send = capture_send
         query = FakeQuery(uid, "block_identity")
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
-        assert captured and "первый разбор" in captured[0][0]
+        assert query.message.replies[0][0] == bot.block_loading_message("block_identity")
+        assert captured and "краткий ориентир" in captured[0][0]
         assert captured[0][1]["parse_mode"] is None
-        assert "Подробный слой" in query.message.replies[-1][0]
+        assert "Полная версия" in query.message.replies[-1][0]
 
         captured.clear()
         bot.collect_transit_snapshots = failing_transits

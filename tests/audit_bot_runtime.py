@@ -53,6 +53,7 @@ def _is_handled_callback(callback: str, source_text: str) -> bool:
 
 
 def main() -> None:
+    assert 45 <= bot.AI_RESPONSE_TIMEOUT_SECONDS <= 55
     assert len(bot.ORACLE_CARD_PROFILES) == 64
     assert all(bot._card_image_path(gate) for gate in range(1, 65))
 

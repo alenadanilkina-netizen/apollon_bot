@@ -66,10 +66,16 @@ AI_PROVIDER_ORDER = [
 ]
 METHODOLOGY_FILE = Path(__file__).parent / "CLAUDE.md"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "3"))
-# Пользователь не должен ждать минутами, пока сторонний текстовый сервис
-# молчит. После короткого таймаута выдаём базовый разбор по уже рассчитанной
-# карте, а не оставляем экран на фразе «Смотрю в карту…».
-AI_RESPONSE_TIMEOUT_SECONDS = min(int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "12")), 15)
+# Кнопка отвечает сразу отдельным служебным сообщением, поэтому полноценному
+# разбору можно дать достаточно времени. Прежние 12 секунд обрывали почти
+# каждый большой запрос до ответа провайдера — пользователь видел один и тот же
+# аварийный текст вместо выбранного зала. Для полной карты реалистичный предел
+# 45–55 секунд; больше ждать уже не имеет смысла.
+try:
+    _configured_ai_timeout = int(os.environ.get("AI_RESPONSE_TIMEOUT_SECONDS", "50"))
+except ValueError:
+    _configured_ai_timeout = 50
+AI_RESPONSE_TIMEOUT_SECONDS = max(45, min(_configured_ai_timeout, 55))
 PRIVACY_POLICY_VERSION = "2026-08-25"
 # Перед публичным запуском эти реквизиты нужно заменить на фактические данные
 # оператора в Railway Variables. Не скрываем инфраструктуру за обещанием
@@ -771,11 +777,25 @@ def fallback_block_reading(uid: int, block: str) -> str:
     }
     topic = block_texts.get(block, "Сейчас полезно вернуть внимание к тому, что действительно зависит от тебя.")
     return (
-        f"{name}, первый разбор по уже построенной карте.\n\n"
+        f"{name}, краткий ориентир по выбранной теме.\n\n"
         f"{type_hint}\n\n{decision_hint}\n\n{topic}\n\n"
         "Проверь этот вывод на ближайшей реальной ситуации: разговоре, выборе или договорённости. "
         "Так карта становится не ярлыком, а способом точнее увидеть свой следующий шаг."
     )
+
+
+def block_loading_message(block: str) -> str:
+    """Короткая честная заставка: не выдаём общий шаблон за готовый разбор."""
+    messages = {
+        "block_identity": "Собираю портрет: как ты действуешь, принимаешь решения и проявляешь силу.",
+        "block_mission": "Смотрю, где твой способ действовать превращается в дело и пользу для других.",
+        "block_potential": "Сопоставляю сильные механики карты с местами, где они могут стать перегрузкой.",
+        "block_love": "Собираю отдельный разбор близости: притяжение, границы, разговоры и повторяющиеся сценарии.",
+        "block_money": "Смотрю на способ создавать ценность, договариваться об оплате и удерживать ресурс в обмене.",
+        "block_health": "Собираю бережный разбор ресурса, нагрузки и условий, в которых тело восстанавливается.",
+        "block_resources": "Смотрю, что возвращает тебе ясность и силы, а что незаметно расходует их впустую.",
+    }
+    return messages.get(block, "Собираю отдельный разбор по выбранной теме.")
 
 
 def fallback_forecast_reading(uid: int, horizon: str) -> str:
@@ -3013,9 +3033,10 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Сырые фрагменты учебной библиотеки не добавляем в публичный промпт.
     # Они были источником «ворот», повторов и обрывов в ответах модели.
 
-    # Первый содержательный ответ уходит синхронно с нажатием. Даже если
-    # внешняя модель недоступна, кнопка не оставляет человека у заставки.
-    await safe_send(query.message, fallback_block_reading(uid, query.data), parse_mode=None)
+    # Не подменяем полноценный разбор одинаковой заготовкой. Пользователь сразу
+    # видит, какая именно тема считается; резервный текст отправится только при
+    # реальной ошибке внешнего провайдера.
+    await query.message.reply_text(block_loading_message(query.data))
     try:
         reply = await ask_claude(uid, full_prompt)
         await safe_send(query.message, f"Подробный взгляд на эту тему:\n\n{reply}")
@@ -3029,8 +3050,9 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         import traceback
         print(f"ERROR in handle_button: {traceback.format_exc()}")
+        await safe_send(query.message, fallback_block_reading(uid, query.data), parse_mode=None)
         await query.message.reply_text(
-            "Подробный слой этого зала сегодня не собрался. Первый разбор уже выше.",
+            "Полная версия этого разбора сейчас недоступна. Краткий ориентир уже выше.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↻ Повторить", callback_data=query.data)],
                 [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
@@ -3287,9 +3309,8 @@ def main():
         print("❌ Нужен TELEGRAM_TOKEN в переменных окружения")
         print("   export TELEGRAM_TOKEN='ваш_токен'")
         return
-    if not ANTHROPIC_API_KEY:
-        print("❌ Нужен ANTHROPIC_API_KEY в переменных окружения")
-        print("   export ANTHROPIC_API_KEY='ваш_ключ'")
+    if not any((anthropic_client, openai_client, compatible_client)):
+        print("❌ Нужен хотя бы один AI-провайдер: ANTHROPIC_API_KEY, OPENAI_API_KEY или совместимый API")
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
