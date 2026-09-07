@@ -301,6 +301,9 @@ ENTRY_KEYBOARD = InlineKeyboardMarkup([
 # В продакшне заменить на базу данных
 
 users = {}  # user_id → {name, birth_data, chart, hd, history, trial_days}
+# Один пользователь может открыть несколько разных залов, но повторное нажатие
+# на одну и ту же кнопку не должно запускать параллельные одинаковые запросы.
+pending_block_readings: set[tuple[int, str]] = set()
 
 # Telegram ограничивает текст одного сообщения 4096 символами. Кроме того,
 # Claude иногда возвращает Markdown, который не проходит строгий парсер Telegram
@@ -2702,6 +2705,37 @@ async def ask_oracle_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ASK_QUESTION
 
 
+async def deliver_block_reading(message_obj, uid: int, block: str, full_prompt: str) -> None:
+    """Собирает один зал вне callback-обработчика.
+
+    Telegram получает подтверждение нажатия сразу. Даже если внешний провайдер
+    отвечает долго, это больше не удерживает очередь обновлений и не делает
+    остальные кнопки немыми.
+    """
+    try:
+        reply = await ask_claude(uid, full_prompt)
+        await safe_send(message_obj, f"Подробный взгляд на эту тему:\n\n{reply}")
+        db_add_block(uid, block)
+        users.setdefault(uid, {}).setdefault("blocks_seen", [])
+        if block not in users[uid]["blocks_seen"]:
+            users[uid]["blocks_seen"].append(block)
+        await message_obj.reply_text(
+            olympus_hub_message(uid), reply_markup=olympus_menu_keyboard(uid)
+        )
+    except Exception:
+        print(f"ERROR block reading {block}: {traceback.format_exc()}", flush=True)
+        await safe_send(message_obj, fallback_block_reading(uid, block), parse_mode=None)
+        await message_obj.reply_text(
+            "Полная версия этого разбора сейчас недоступна. Краткий ориентир уже выше.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↻ Повторить", callback_data=block)],
+                [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
+            ]),
+        )
+    finally:
+        pending_block_readings.discard((uid, block))
+
+
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -3033,33 +3067,20 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Сырые фрагменты учебной библиотеки не добавляем в публичный промпт.
     # Они были источником «ворот», повторов и обрывов в ответах модели.
 
-    # Не подменяем полноценный разбор одинаковой заготовкой. Пользователь сразу
-    # видит, какая именно тема считается; резервный текст отправится только при
-    # реальной ошибке внешнего провайдера.
-    await query.message.reply_text(block_loading_message(query.data))
-    try:
-        reply = await ask_claude(uid, full_prompt)
-        await safe_send(query.message, f"Подробный взгляд на эту тему:\n\n{reply}")
-        # Помечаем тему только после успешного ответа. Иначе текущий блок
-        # попадал в «уже разобрано» ещё до чтения и модель сама себя просила
-        # его не повторять.
-        db_add_block(uid, query.data)
-        users[uid].setdefault("blocks_seen", [])
-        if query.data not in users[uid]["blocks_seen"]:
-            users[uid]["blocks_seen"].append(query.data)
-    except Exception as e:
-        import traceback
-        print(f"ERROR in handle_button: {traceback.format_exc()}")
-        await safe_send(query.message, fallback_block_reading(uid, query.data), parse_mode=None)
-        await query.message.reply_text(
-            "Полная версия этого разбора сейчас недоступна. Краткий ориентир уже выше.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↻ Повторить", callback_data=query.data)],
-                [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
-            ]),
-        )
+    # Не удерживаем callback в ожидании большой модели: Telegram подтверждает
+    # нажатие и сразу освобождает следующие кнопки. Результат приходит отдельным
+    # сообщением, когда расчёт будет готов.
+    pending_key = (uid, query.data)
+    if pending_key in pending_block_readings:
+        await query.message.reply_text("Этот зал уже рассчитывается. Послание придёт отдельным сообщением.")
         return CHAT
-    await query.message.reply_text(olympus_hub_message(uid), reply_markup=olympus_menu_keyboard(uid))
+
+    pending_block_readings.add(pending_key)
+    await query.message.reply_text(block_loading_message(query.data))
+    asyncio.create_task(
+        deliver_block_reading(query.message, uid, query.data, full_prompt),
+        name=f"olympus-reading-{uid}-{query.data}",
+    )
     users[uid]["menu_shown"] = True
     return CHAT
 

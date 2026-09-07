@@ -58,6 +58,7 @@ async def main() -> None:
         bot.safe_send = capture_send
         query = FakeQuery(uid, "block_potential")
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
+        await asyncio.sleep(0)
         assert query.message.replies[0][0] == bot.block_loading_message("block_potential")
         assert captured and "У тебя есть отдельный полный разбор потенциала." in captured[0][0]
         assert "краткий ориентир" not in captured[0][0]
@@ -67,6 +68,7 @@ async def main() -> None:
         bot.safe_send = capture_send
         query = FakeQuery(uid, "block_identity")
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
+        await asyncio.sleep(0)
         assert query.message.replies[0][0] == bot.block_loading_message("block_identity")
         assert captured and "краткий ориентир" in captured[0][0]
         assert captured[0][1]["parse_mode"] is None

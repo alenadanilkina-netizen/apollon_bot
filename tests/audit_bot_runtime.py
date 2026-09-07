@@ -100,6 +100,8 @@ def main() -> None:
         if not _is_handled_callback(callback, source_text)
     }
     assert not unhandled, f"unhandled callback buttons: {sorted(unhandled)}"
+    assert "asyncio.create_task(" in source_text
+    assert "deliver_block_reading" in source_text
 
     print(
         "OK: 64 cards, 384 lines, birth parser and "
