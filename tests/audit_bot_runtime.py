@@ -47,6 +47,8 @@ def _is_handled_callback(callback: str, source_text: str) -> bool:
         return bool(re.search(r"query[.]data[.]startswith\(['\"]brand_answer:", source_text))
     if callback.startswith("forecast_"):
         return bool(re.search(r"query[.]data[.]startswith\(['\"]forecast_", source_text))
+    if callback.startswith("persona_"):
+        return "query.data.removeprefix(\"persona_\")" in source_text
     if callback.startswith("compat_type_"):
         return "query.data in (\"compat_type_business\", \"compat_type_personal\")" in source_text
     return False

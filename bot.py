@@ -198,13 +198,13 @@ def db_save_user(tg_id: int, username: str, name: str, birth: dict, hd_type: str
 def db_load_user(tg_id: int) -> dict | None:
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
-        "SELECT name, birth_day, birth_month, birth_year, birth_hour, birth_minute, city, lat, lon, utc_offset, blocks_seen, trial_started, brand_data FROM users WHERE tg_id=?",
+        "SELECT birth_day, birth_month, birth_year, birth_hour, birth_minute, city, lat, lon, utc_offset, blocks_seen, trial_started, brand_data FROM users WHERE tg_id=?",
         (tg_id,)
     ).fetchone()
-    if not row or not row[1]:
+    if not row or not row[0]:
         con.close()
         return None
-    name, d, m, y, h, mi, city, lat, lon, utc_offset, blocks_json, trial_started, brand_json = row
+    d, m, y, h, mi, city, lat, lon, utc_offset, blocks_json, trial_started, brand_json = row
     if not trial_started:
         trial_started = datetime.now().isoformat()
         con.execute("UPDATE users SET trial_started=? WHERE tg_id=?", (trial_started, tg_id))
@@ -220,7 +220,6 @@ def db_load_user(tg_id: int) -> dict | None:
     except Exception:
         brand_data = {}
     return {
-        "name": name,
         "birth": {"day": d, "month": m, "year": y, "hour": h, "minute": mi or 0,
                   "city": city or "", "lat": lat, "lon": lon, "utc_offset": utc_offset},
         "blocks_seen": blocks_seen,
@@ -726,65 +725,115 @@ ask_ai = ask_claude
 
 
 def _hd_label(raw: str, marker: str) -> str:
-    match = re.search(rf"^{re.escape(marker)}:\s*(.+)$", raw, flags=re.MULTILINE)
+    match = re.search(rf"^{re.escape(marker)}\s*:\s*(.+)$", raw, flags=re.MULTILINE | re.IGNORECASE)
     return match.group(1).strip() if match else ""
 
 
-def fallback_block_reading(uid: int, block: str) -> str:
-    """Первый устойчивый разбор: он уходит сразу, независимо от внешнего AI."""
+OLYMPUS_PERSONAS = {
+    "f": ("Наисветлейшая Афродита", "Мудрая Афина", "Сребролукая Артемида", "Неукротимая Гера"),
+    "m": ("Зевсоподобный", "Могущественный Прометей", "Стремительный Гермес", "Светоносный Аполлон"),
+    "n": ("Странник Олимпа", "Хранитель ясности", "Друг муз", "Гость амфитеатра"),
+}
+
+
+def olympian_alias(uid: int) -> str:
+    """Игровое обращение не связано с именем, ником или датой рождения."""
     user = users.get(uid, {})
-    name = user.get("name") or "Ты"
+    gender = user.get("persona_gender", "n")
+    options = OLYMPUS_PERSONAS.get(gender, OLYMPUS_PERSONAS["n"])
+    return options[uid % len(options)]
+
+
+def _decision_hint(authority: str) -> str:
+    lowered = authority.casefold()
+    if "эмоц" in lowered:
+        return "Важные решения лучше не принимать на первом подъёме или первом разочаровании: дай чувству пройти полный круг и вернись к вопросу позже."
+    if "сакрал" in lowered:
+        return "Полезный ориентир для выбора — простой телесный отклик: становится ли от варианта больше живой готовности действовать."
+    if "селез" in lowered:
+        return "Сигнал приходит тихо и быстро: сначала замечай первое спокойное ощущение безопасности, а уже потом ищи ему объяснение."
+    if "эго" in lowered or "вол" in lowered:
+        return "Перед обещанием сверяйся не с чужими ожиданиями, а с тем, есть ли у тебя реальный ресурс это выдержать."
+    return "Перед важным выбором полезно сделать паузу и проверить: это твой следующий шаг или попытка успеть за чужим темпом."
+
+
+def _type_hint(type_text: str) -> str:
+    lowered = type_text.casefold()
+    if "проектор" in lowered:
+        return "Твоя сильная сторона — видеть устройство людей и процессов. Она особенно заметна там, где есть живой запрос, а не необходимость постоянно доказывать свою полезность."
+    if "манифест" in lowered:
+        return "Твоя сила проявляется, когда ты честно называешь направление и заранее предупреждаешь тех, кого затронет твой шаг. Так вокруг действия становится меньше сопротивления."
+    if "генератор" in lowered:
+        return "Твоя устойчивость растёт в делах, на которые есть внутренний отклик. Длинная работа становится посильной, когда она не начата из одного только долга."
+    if "рефлектор" in lowered:
+        return "Ты особенно точно считываешь среду и людей рядом. Для крупных решений важны не скорость, а время, разные точки зрения и пространство без давления."
+    return "В этой карте важны не универсальные советы, а твой собственный темп, способ выбирать и условия, в которых внимание становится ясным."
+
+
+def ready_block_reading(uid: int, block: str) -> str:
+    """Готовый разбор из уже рассчитанной карты без сети и внешнего ИИ."""
+    user = users.get(uid, {})
     hd_raw = str(user.get("hd", {}).get("raw", ""))
     type_text = _hd_label(hd_raw, "ТИП")
     authority = _hd_label(hd_raw, "АВТОРИТЕТ")
-    type_hint = (
-        "Твоя сила не в постоянном рывке, а в точном видении людей и ситуаций; "
-        "лучше всего она включается, когда к тебе действительно обращаются."
-        if "Проектор" in type_text else
-        "Твоя сила заметнее всего там, где действие даёт телесный отклик, а не только кажется правильным головой."
-    )
-    decision_hint = (
-        "С важными решениями полезно дать себе время: ясность приходит не на эмоциональном пике, а после него."
-        if "Эмоцион" in authority else
-        "С важными решениями сверяйся с прямым ощущением: есть ли у тебя на это настоящее внутреннее «да»."
-    )
+    profile = _hd_label(hd_raw, "ПРОФИЛЬ")
+    type_hint = _type_hint(type_text)
+    decision_hint = _decision_hint(authority)
     block_texts = {
         "block_identity": (
-            "Твой характер проявляется не в постоянной демонстрации силы, а в способности заметить суть и назвать её точно. "
-            "Там, где другие торопятся, ты можешь увидеть устройство ситуации и предложить более ясный ход."
+            "Тема этого зала — твой способ быть собой среди других. Посмотри, где ты становишься заметнее не потому, что говоришь громче, а потому, что называешь суть происходящего.\n\n"
+            "В делах и разговорах твоя опора появляется, когда есть конкретный вопрос, задача или человек, готовый услышать ответ. Не нужно превращать каждую встречу в экзамен на ценность: достаточно выбирать ситуации, где твой взгляд действительно нужен.\n\n"
+            "Проверь это на неделе: в одном разговоре не спеши заполнять паузу. Сначала пойми, о чём тебя на самом деле спрашивают, затем сформулируй одну точную мысль."
         ),
         "block_mission": (
-            "Твоё дело раскрывается там, где нужно соединить наблюдательность, смысл и практическое решение. "
-            "Выбирай задачи, в которых твой взгляд меняет не только настроение, но и сам способ действовать."
+            "Призвание здесь не про одну идеальную профессию, а про повторяющуюся пользу: какую ясность ты умеешь вносить в хаос, что умеешь собирать и делать выполнимым.\n\n"
+            "Твоё дело раскрывается в задачах, где можно соединить внимание к людям, смысл и практический результат. Сильный проект для тебя — тот, после которого у других появляется не только вдохновение, но и понятный следующий шаг.\n\n"
+            "Выбери один текущий проект и сформулируй его пользу без громких слов: кому он помогает, что меняется и по какому признаку это будет видно."
         ),
         "block_potential": (
-            "Твой потенциал растёт, когда внимательность превращается в действие. Риск появляется там, где ты слишком долго готовишься, "
-            "объясняешь или берёшь на себя чужую ответственность вместо того, чтобы обозначить собственную границу."
+            "Потенциал заметен не только в том, что получается легко, но и в том, как ты обходишься с перегрузкой. Твоя сильная способность — превращать наблюдение в точное действие, а не копить знания ради ощущения готовности.\n\n"
+            "Слабое место появляется, когда ты берёшь на себя чужую ответственность, слишком долго готовишься или пытаешься объяснить очевидное тому, кто не готов слушать. Тогда силы уходят на поддержание процесса, который не просит твоего участия.\n\n"
+            "На ближайшей задаче отдели своё обязательство от чужого: что именно сделаешь ты, что должен решить другой человек и к какому сроку это станет ясно."
         ),
         "block_love": (
-            "В близости тебе важны честный разговор и чувство, что тебя действительно видят. "
-            "Не соглашайся на отношения, где приходится угадывать правила или заслуживать право на внимание."
+            "В близости для тебя важны не угадывание и не красивые обещания, а ощущение взаимного участия. Связь становится надёжнее, когда можно прямо говорить о желаниях, границах и темпе сближения.\n\n"
+            "Обрати внимание, где ты начинаешь заслуживать право на внимание или молча выполнять чужие ожидания. Там полезнее не добавлять усилий, а прояснять правила: что вы оба готовы давать, о чём договариваться и что не подходит.\n\n"
+            "Практический шаг — выбрать один разговор и заменить намёк на прямую фразу: «Мне важно понять…», «Я могу…», «Мне не подходит…»."
         ),
         "block_money": (
-            "Деньги лучше приходят туда, где ты называешь ценность своей работы и заранее обсуждаешь условия. "
-            "Смотри не только на сумму, но и на обмен: остаются ли у тебя силы после того, как ты выполнила обещанное."
+            "Деньги в этой теме — не проверка твоей ценности, а способ увидеть качество обмена. Доход становится устойчивее, когда заранее ясны результат, объём работы, срок и цена, а не когда условия приходится угадывать в процессе.\n\n"
+            "Полезно смотреть не только на сумму, но и на остаток сил после обещанного. Если работа съедает весь ресурс, её цена или границы требуют пересмотра. Если польза очевидна, не прячь её за скромностью: назови, что именно ты делаешь и почему это имеет стоимость.\n\n"
+            "Выбери один текущий обмен и запиши в трёх строках: результат, срок и условия оплаты. Это превращает тревогу о деньгах в разговор о договорённости."
         ),
         "block_health": (
-            "Тело полезно слышать раньше, чем оно вынуждено повышать голос. Режим становится устойчивее, когда в нём есть паузы, "
-            "сон и выполнимые границы, а не попытка компенсировать усталость силой воли."
+            "Этот зал не ставит диагнозов и не заменяет врача. Он про то, как бережнее распределять нагрузку, чтобы тело не было вынуждено сообщать о перегрузе слишком громко.\n\n"
+            "Режим становится устойчивее не от идеальности, а от повторяемых опор: сон, еда, движение, паузы и понятная граница рабочего времени. Попытка компенсировать усталость силой воли обычно делает восстановление длиннее.\n\n"
+            "На ближайшие семь дней выбери одну посильную опору — например, время отхода ко сну или короткую прогулку — и не добавляй к ней героических условий."
         ),
         "block_resources": (
-            "Восстановление начинается с того, чтобы убрать лишние сигналы и вернуть себе среду, в которой можно думать и чувствовать без постоянной обороны. "
-            "Выбирай один небольшой ритуал, который реально повторишь на этой неделе."
+            "Восстановление начинается не с нового рывка, а с уменьшения лишнего шума. Вспомни, после каких людей, мест и задач ты чувствуешь ясность, а после каких долго возвращаешь себя в нормальный темп.\n\n"
+            "Ресурс редко возвращается одной большой переменой. Чаще он складывается из маленьких повторяемых вещей: тишины, телесного движения, законченных дел, времени без уведомлений и права не отвечать мгновенно.\n\n"
+            "Выбери один ритуал, который можно повторить три раза на этой неделе. Не идеальный — реальный. Олимп уважает устойчивость больше, чем красивую усталость."
         ),
     }
     topic = block_texts.get(block, "Сейчас полезно вернуть внимание к тому, что действительно зависит от тебя.")
+    calculated = []
+    if type_text:
+        calculated.append("твой способ действовать")
+    if authority:
+        calculated.append("способ принимать решения")
+    if profile:
+        calculated.append("устойчивые роли в отношениях и работе")
+    method = ", ".join(calculated) or "уже построенная личная карта"
     return (
-        f"{name}, краткий ориентир по выбранной теме.\n\n"
+        f"{olympian_alias(uid)}, разбор по выбранной теме.\n\n"
+        f"Этот текст собран из того, как в твоей карте проявляются {method}.\n\n"
         f"{type_hint}\n\n{decision_hint}\n\n{topic}\n\n"
-        "Проверь этот вывод на ближайшей реальной ситуации: разговоре, выборе или договорённости. "
-        "Так карта становится не ярлыком, а способом точнее увидеть свой следующий шаг."
+        "Проверь вывод на реальной ситуации — разговоре, выборе или договорённости. Так карта остаётся не ярлыком, а способом точнее увидеть следующий шаг."
     )
+
+
+fallback_block_reading = ready_block_reading
 
 
 def block_loading_message(block: str) -> str:
@@ -809,12 +858,17 @@ def fallback_forecast_reading(uid: int, horizon: str) -> str:
         "forecast_year": "на годовой период",
     }
     period = labels.get(horizon, "на текущий период")
+    focus = {
+        "forecast_day": "Сегодня полезно не раздувать список дел. Выбери одно обязательство, которое действительно можно завершить, и один разговор, который стоит прояснить.",
+        "forecast_month": "В ближайший месяц держи в фокусе договорённости и ритм: что повторяется, где обещания стали тяжелее, чем польза, и что нужно переоформить словами.",
+        "forecast_3months": "Три месяца — хороший горизонт для одной последовательной перемены, а не для десяти параллельных начинаний. Выбери направление и задай ему измеримый ритм.",
+        "forecast_year": "Годовой сюжет лучше читать как череду решений и последствий. Смотри, какой навык, союз или способ работы стоит укрепить, чтобы он поддерживал тебя дальше.",
+    }.get(horizon, "Сначала верни себе ясность в ближайшем шаге, затем выбирай следующий.")
     return (
-        f"Первый ориентир {period}.\n\n"
-        "Не принимай крупных решений из ощущения срочности. Сначала проверь, что уже требует завершения, "
-        "какой разговор нельзя откладывать и где твоё время уходит без ясного обмена.\n\n"
-        "Выбери один наблюдаемый шаг на этот период: закрыть обязательство, уточнить условия или освободить место для действительно важного дела. "
-        "Это практическая навигация по уже построенной личной карте."
+        f"{olympian_alias(uid)}, ориентир {period}.\n\n"
+        "Прогноз собран как практическая навигация по уже рассчитанной личной карте и календарному горизонту. Он не обещает событий и не заменяет твоего решения.\n\n"
+        f"{focus}\n\n{_decision_hint(_hd_label(str(users.get(uid, {}).get('hd', {}).get('raw', '')), 'АВТОРИТЕТ'))}\n\n"
+        "Проверь один результат в конце выбранного периода: стало ли больше ясности, устойчивости и честного обмена — или план требует пересборки."
     )
 
 # ─── ГЕОКОДЕР (простой) ──────────────────────────────────────────────────────
@@ -1008,12 +1062,33 @@ async def after_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    users[uid]["name"] = update.message.text.strip()
     await update.message.reply_text(
-        f"Хорошо, {users[uid]['name']}. Дата рождения — день, месяц, год. Например: 23.02.1981"
+        "Имя для Олимпа не нужно. Выбери форму обращения кнопкой выше, затем пришли дату, время и место рождения одной строкой."
     )
-    return ASK_DATE
+    return ASK_NAME
+
+
+async def handle_persona(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Запоминает только выбранную форму игрового обращения, не имя пользователя."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    gender = query.data.removeprefix("persona_")
+    if gender not in OLYMPUS_PERSONAS:
+        gender = "n"
+    users.setdefault(uid, {"history": []})["persona_gender"] = gender
+    await query.message.reply_text(
+        f"{olympian_alias(uid)}, теперь пришли дату, время и место рождения одной строкой.\n\n"
+        "Формат: 23.02.1981, 09:50, Суленцин, Польша"
+    )
+    return ASK_BIRTH
+
+
+PERSONA_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🌙 В женском роде", callback_data="persona_f")],
+    [InlineKeyboardButton("☀️ В мужском роде", callback_data="persona_m")],
+    [InlineKeyboardButton("🏛 Без рода", callback_data="persona_n")],
+])
 
 
 def parse_birth_payload(text: str) -> tuple[dict, str] | None:
@@ -1059,17 +1134,15 @@ async def _finish_birth_calculation(update: Update, uid: int) -> int:
         users[uid]["hd"] = hd
 
         username = update.effective_user.username or ""
-        name = users[uid].get("name") or update.effective_user.first_name or "Гость Олимпа"
-        users[uid]["name"] = name
         hd_raw = hd.get("raw", "")
         hd_type = next((line.strip() for line in hd_raw.splitlines()
                         if "Тип:" in line or "TYPE" in line.upper()), "")
-        db_save_user(uid, username, name, birth, hd_type,
+        db_save_user(uid, username, "", birth, hd_type,
                      trial_started=users[uid].get("trial_start"),
                      consent_at=users[uid].get("consent_at"))
 
         await update.message.reply_text(
-            f"{name}, личная карта собрана.\n\n"
+            f"{olympian_alias(uid)}, личная карта собрана.\n\n"
             "В ней несколько оптик: как ты принимаешь решения, где проявляешь силу, "
             "что ищешь в близости и какой период сейчас проживаешь. Откроем их по одной — "
             "иначе получится не карта, а стенограмма собрания богов."
@@ -2567,30 +2640,16 @@ def get_forecast_prompt(period: str, transits_data: str) -> str:
 
 
 def personal_data_documents_keyboard(uid: int) -> InlineKeyboardMarkup:
-    """Два документа и отдельное подтверждение согласия после ознакомления."""
-    user = users.get(uid, {})
-    rows = [
+    """Один понятный документ и зафиксированное принятие политики."""
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📜 Политика конфиденциальности", callback_data="privacy_policy")],
-        [InlineKeyboardButton("📝 Согласие на обработку персональных данных", callback_data="personal_data_consent")],
-    ]
-    if user.get("privacy_policy_seen") and user.get("personal_data_consent_seen"):
-        rows.append([InlineKeyboardButton("✅ Даю согласие на обработку данных", callback_data="personal_consent_yes")])
-    rows.append([InlineKeyboardButton("← Вернуться к Оракулу", callback_data="personal_consent_no")])
-    return InlineKeyboardMarkup(rows)
+        [InlineKeyboardButton("✅ Я ознакомился(-ась) и принимаю политику", callback_data="privacy_accept")],
+        [InlineKeyboardButton("← Вернуться к Оракулу", callback_data="personal_consent_no")],
+    ])
 
 
 def personal_data_documents_status(uid: int) -> str:
-    user = users.get(uid, {})
-    read = []
-    if user.get("privacy_policy_seen"):
-        read.append("политика конфиденциальности")
-    if user.get("personal_data_consent_seen"):
-        read.append("согласие на обработку персональных данных")
-    if len(read) == 2:
-        return "С обоими документами можно ознакомиться выше. Теперь подтверди согласие отдельной кнопкой."
-    if read:
-        return f"Открыт документ: {read[0]}. Прочитай второй документ, затем появится кнопка согласия."
-    return "Открой оба документа. После этого появится отдельная кнопка согласия."
+    return "Сначала открой политику, затем подтверди её принятие отдельной кнопкой."
 
 
 async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2603,41 +2662,24 @@ async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"Политика конфиденциальности (версия {PRIVACY_POLICY_VERSION})\n\n"
             f"Оператор: {PRIVACY_OPERATOR_NAME}. Контакт по вопросам данных: {PRIVACY_CONTACT}.\n\n"
-            "Что обрабатывается: Telegram ID, имя/ник, дата, время и место рождения, а также сообщения, "
+            "Что обрабатывается: Telegram ID, дата, время и место рождения, а также сообщения, "
             "которые ты добровольно отправляешь боту.\n\n"
             "Зачем: построить личную карту, хранить её для повторного доступа и поддерживать диалог бота. "
             "Мы не продаём, не публикуем и не передаём эти данные для рекламы.\n\n"
             "Где: сообщения проходят через Telegram; техническое хранение бота происходит в его базе данных "
-            "на инфраструктуре Railway. При использовании функции ИИ текст запроса может быть передан "
+            "на инфраструктуре Railway. Если включён ИИ-разбор, текст запроса может быть передан "
             "подключённому ИИ-провайдеру только для формирования ответа.\n\n"
-            "Срок: до удаления по запросу пользователя или прекращения работы бота. Чтобы отозвать согласие "
+            "Имя и ник не запрашиваются для построения карты. Срок: до удаления по запросу пользователя или прекращения работы бота. Чтобы отозвать принятие политики "
             "и удалить сохранённую карту, используй команду /delete_my_data или напиши оператору: " + PRIVACY_CONTACT + ".\n\n"
             + personal_data_documents_status(uid),
             reply_markup=personal_data_documents_keyboard(uid),
         )
         return ASK_CONSENT
 
-    if query.data == "personal_data_consent":
-        user["personal_data_consent_seen"] = True
-        await query.message.reply_text(
-            "Согласие на обработку персональных данных\n\n"
-            f"Я подтверждаю, что добровольно передаю оператору {PRIVACY_OPERATOR_NAME} данные, "
-            "которые введу в боте: дату, время и место рождения, Telegram ID, имя или ник и сообщения.\n\n"
-            "Цель обработки: построение и сохранение личной карты, повторный доступ к ней и ответы бота на мои запросы. "
-            "С данными могут выполняться сбор, запись, хранение, уточнение, использование и удаление — только для этих целей.\n\n"
-            "Согласие действует до его отзыва. Я могу отозвать его и запросить удаление данных командой /delete_my_data "
-            f"или через {PRIVACY_CONTACT}.\n\n"
-            + personal_data_documents_status(uid),
-            reply_markup=personal_data_documents_keyboard(uid),
-        )
-        return ASK_CONSENT
-
-    if query.data in {"consent_yes", "personal_consent_yes"}:
-        if query.data == "personal_consent_yes" and not (
-            user.get("privacy_policy_seen") and user.get("personal_data_consent_seen")
-        ):
+    if query.data in {"consent_yes", "personal_consent_yes", "privacy_accept"}:
+        if query.data == "privacy_accept" and not user.get("privacy_policy_seen"):
             await query.message.reply_text(
-                "Перед согласием нужно открыть два документа: политику конфиденциальности и согласие на обработку персональных данных.",
+                "Сначала открой политику конфиденциальности, затем подтверди её принятие.",
                 reply_markup=personal_data_documents_keyboard(uid),
             )
             return ASK_CONSENT
@@ -2646,13 +2688,13 @@ async def handle_consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         db_save_consent(uid, user["consent_at"])
         if not isinstance(user.get("trial_start"), datetime):
             user["trial_start"] = datetime.now()
-        if query.data == "personal_consent_yes":
+        if query.data in {"personal_consent_yes", "privacy_accept"}:
             await query.message.reply_text(
-                "Совет получил согласие. Теперь пришли три координаты одной строкой.\n\n"
-                "Формат: 23.02.1981, 09:50, Суленцин, Польша\n\n"
-                "Точное время особенно важно: оно влияет на дома карты и расчёт Дизайна Человека."
+                "Политика принята. Имя не нужно: оно не влияет на расчёт.\n\n"
+                "Выбери только форму игрового обращения — она нужна для языка ответов, а не для идентификации.",
+                reply_markup=PERSONA_KEYBOARD,
             )
-            return ASK_BIRTH
+            return ASK_NAME
         await query.message.reply_text(
             FIRST_OLYMPUS_TEXT,
             reply_markup=ENTRY_KEYBOARD,
@@ -2705,16 +2747,10 @@ async def ask_oracle_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ASK_QUESTION
 
 
-async def deliver_block_reading(message_obj, uid: int, block: str, full_prompt: str) -> None:
-    """Собирает один зал вне callback-обработчика.
-
-    Telegram получает подтверждение нажатия сразу. Даже если внешний провайдер
-    отвечает долго, это больше не удерживает очередь обновлений и не делает
-    остальные кнопки немыми.
-    """
+async def deliver_block_reading(message_obj, uid: int, block: str) -> None:
+    """Выдаёт законченный разбор, не зависящий от внешней модели."""
     try:
-        reply = await ask_claude(uid, full_prompt)
-        await safe_send(message_obj, f"Подробный взгляд на эту тему:\n\n{reply}")
+        await safe_send(message_obj, ready_block_reading(uid, block), parse_mode=None)
         db_add_block(uid, block)
         users.setdefault(uid, {}).setdefault("blocks_seen", [])
         if block not in users[uid]["blocks_seen"]:
@@ -2724,9 +2760,8 @@ async def deliver_block_reading(message_obj, uid: int, block: str, full_prompt: 
         )
     except Exception:
         print(f"ERROR block reading {block}: {traceback.format_exc()}", flush=True)
-        await safe_send(message_obj, fallback_block_reading(uid, block), parse_mode=None)
         await message_obj.reply_text(
-            "Полная версия этого разбора сейчас недоступна. Краткий ориентир уже выше.",
+            "Не получилось отправить расчёт. Нажми «Повторить» — карта уже сохранена.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↻ Повторить", callback_data=block)],
                 [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
@@ -2804,13 +2839,11 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "oracle_to_olympus":
         users.setdefault(uid, {}).pop("privacy_policy_seen", None)
-        users.setdefault(uid, {}).pop("personal_data_consent_seen", None)
         await query.message.reply_text(
             "Совет дошёл до части церемонии, которую даже Зевс не имеет права пропустить.\n\n"
             "Чтобы построить твою личную карту, понадобятся дата, точное время и место рождения. "
-            "Это персональные данные. Перед вводом ознакомься с двумя документами ниже: "
-            "политикой конфиденциальности и согласием на обработку персональных данных.\n\n"
-            "После прочтения обоих документов появится отдельная кнопка, которой ты подтвердишь согласие.",
+            "Это персональные данные. Перед вводом открой политику обработки данных, затем подтверди её принятие отдельной кнопкой. "
+            "Оракул доступен и без личной карты.",
             reply_markup=personal_data_documents_keyboard(uid),
         )
         return ASK_CONSENT
@@ -2985,6 +3018,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if query.data.startswith("forecast_"):
+        # Прогноз выдаётся из уже рассчитанной карты сразу. Внешние эфемериды
+        # и ИИ больше не являются условием ответа на кнопку.
+        await safe_send(query.message, fallback_forecast_reading(uid, query.data), parse_mode=None)
+        await query.message.reply_text("Выбери другой горизонт или вернись на Олимп.", reply_markup=FORECAST_KEYBOARD)
+        return CHAT
+
         birth = users[uid].get("birth", {})
         today = datetime.now()
         # Пользователь получает ориентир сразу. Внешние эфемериды и ИИ могут
@@ -3038,8 +3077,10 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as exc:
                     print(f"WARN forecast lunar_return: {type(exc).__name__}: {exc}", flush=True)
 
-            name = users[uid].get("name", "")
-            prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{get_forecast_prompt(query.data, transits_str + extra_str)}"
+            prompt = (
+                "Обращайся на 'ты' без имени; используй нейтральные формулировки.\n\n"
+                f"{get_forecast_prompt(query.data, transits_str + extra_str)}"
+            )
             reply = await ask_claude(uid, prompt)
             await safe_send(query.message, reply)
         except asyncio.TimeoutError:
@@ -3061,15 +3102,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return CHAT
 
-    name = users[uid].get("name", "")
-    full_prompt = f"Имя: {name}. Обращайся на 'ты'; согласуй род по имени, а если он неочевиден — используй нейтральные формулировки.\n\n{prompt}"
-
-    # Сырые фрагменты учебной библиотеки не добавляем в публичный промпт.
-    # Они были источником «ворот», повторов и обрывов в ответах модели.
-
-    # Не удерживаем callback в ожидании большой модели: Telegram подтверждает
-    # нажатие и сразу освобождает следующие кнопки. Результат приходит отдельным
-    # сообщением, когда расчёт будет готов.
+    # Не ждём внешний ИИ: разбор строится из сохранённой личной карты.
     pending_key = (uid, query.data)
     if pending_key in pending_block_readings:
         await query.message.reply_text("Этот зал уже рассчитывается. Послание придёт отдельным сообщением.")
@@ -3078,7 +3111,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pending_block_readings.add(pending_key)
     await query.message.reply_text(block_loading_message(query.data))
     asyncio.create_task(
-        deliver_block_reading(query.message, uid, query.data, full_prompt),
+        deliver_block_reading(query.message, uid, query.data),
         name=f"olympus-reading-{uid}-{query.data}",
     )
     users[uid]["menu_shown"] = True
@@ -3342,7 +3375,10 @@ def main():
         states={
             ASK_CONSENT:  [CallbackQueryHandler(handle_consent)],
             ASK_ENTRY:    [CallbackQueryHandler(handle_entry)],
-            ASK_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
+            ASK_NAME:     [
+                CallbackQueryHandler(handle_persona, pattern=r"^persona_[fmn]$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name),
+            ],
             ASK_DATE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_date)],
             ASK_TIME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             ASK_PLACE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_place)],
