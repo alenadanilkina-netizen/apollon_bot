@@ -2526,14 +2526,30 @@ async def send_oracle_card(message_obj, uid: int):
                 )
         except Exception as exc:
             print(f"WARN oracle image gate={gate_number}: {exc}")
-            # Если изображение по какой-то причине не загрузилось, человек всё
-            # равно получает полное послание и выбор линии отдельным сообщением.
-            await safe_send(
-                message_obj,
-                oracle_message,
-                reply_markup=ORACLE_LINE_KEYBOARD,
-                parse_mode=None,
-            )
+            # Второй способ доставки сохраняет саму карту, а не только текст.
+            # Telegram иногда принимает PNG как документ, даже если отклонил
+            # preview фотографии после долгой загрузки.
+            try:
+                with image_path.open("rb") as image_file:
+                    await message_obj.reply_document(
+                        document=image_file,
+                        caption=oracle_message,
+                        parse_mode=None,
+                        reply_markup=ORACLE_LINE_KEYBOARD,
+                        connect_timeout=20,
+                        read_timeout=60,
+                        write_timeout=60,
+                        pool_timeout=20,
+                    )
+            except Exception as document_exc:
+                print(f"WARN oracle document gate={gate_number}: {document_exc}")
+                # Текст и кнопки всё равно не должны пропасть вместе с медиа.
+                await safe_send(
+                    message_obj,
+                    oracle_message,
+                    reply_markup=ORACLE_LINE_KEYBOARD,
+                    parse_mode=None,
+                )
     else:
         # Не допускаем «тихой» ошибки при отсутствующем ассете: текст важнее
         # декоративной иллюстрации и должен быть доставлен в любом случае.
