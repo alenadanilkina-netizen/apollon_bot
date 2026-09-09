@@ -84,7 +84,9 @@ async def main() -> None:
             "hd": {"raw": "ТИП: Генератор\nАВТОРИТЕТ: Сакральный"},
             "persona_gender": "m",
         }
-        assert "Алёна" not in bot.ready_block_reading(uid, "block_identity")
+        isolated_reading = bot.ready_block_reading(uid, "block_identity")
+        assert "Алёна" not in isolated_reading
+        assert "1981" not in isolated_reading
         assert bot.olympian_alias(uid) != bot.olympian_alias(other_uid)
     finally:
         bot.safe_send = original_send
