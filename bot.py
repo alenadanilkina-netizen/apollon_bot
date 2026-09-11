@@ -2,6 +2,10 @@
 """
 Телеграм-бот Алёны Данилкиной
 Анализ карты через пантеон греческих богов + HD
+
+Критическое правило релизов: методологию личного зала нельзя подменять
+универсальным текстом. При недоступности расчёта бот сообщает об ошибке и
+предлагает повторить именно выбранный расчёт.
 """
 
 from __future__ import annotations
@@ -609,7 +613,38 @@ d) Где противоречат — это НАПРЯЖЕНИЕ, самое �
 — В теме здоровья не называй диагнозы и конкретные симптомы как установленный факт; предлагай обратиться к врачу при жалобах.
 """
 
-def _ask_claude_sync(user_id: int, message: str) -> str:
+_PERSONAL_CALCULATION_LINE = re.compile(
+    r"^\s*(?:═+\s*)?(?:натальная карта|дизайн человека|дата|координаты|место рождения|timezone|utc)\b",
+    re.IGNORECASE,
+)
+
+
+def _anonymized_calculation(raw: object) -> str:
+    """Удаляет исходные идентификаторы из уже рассчитанной карты."""
+    result: list[str] = []
+    for line in str(raw or "").splitlines():
+        if _PERSONAL_CALCULATION_LINE.match(line):
+            continue
+        result.append(line)
+    return "\n".join(result).strip()
+
+
+def _anonymized_ai_context(chart: dict, hd: dict) -> str:
+    """Передаёт провайдеру только производные факты, без анкеты рождения."""
+    chart_str = _anonymized_calculation(chart.get("raw", ""))
+    hd_str = _anonymized_calculation(hd.get("raw", ""))
+    return (
+        "\n\nОБЕЗЛИЧЕННЫЕ РАСЧЁТНЫЕ ФАКТЫ (не называй технические термины пользователю):"
+        f"\nАСТРОЛОГИЯ:\n{chart_str}"
+        f"\n\nБОДИГРАФ:\n{hd_str}"
+        f"\n\nБИБЛИОТЕКА БОДИГРАФА:\n{get_hd_context(hd)}"
+        f"\n\nПРОФИЛЬ:\n{get_profile_context(hd)}"
+        f"\n\nСКВОЗНОЙ СЮЖЕТ КАРТЫ:\n{get_cross_context(hd)}"
+        f"\n\nРЕЖИМ И ВОССТАНОВЛЕНИЕ:\n{get_phs_context(hd)}"
+    )
+
+
+def _ask_claude_sync(user_id: int, message: str, include_history: bool = True) -> str:
     user = users.get(user_id, {})
     history = user.get("history", [])
 
@@ -627,11 +662,6 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
     if user.get("chart") or user.get("hd"):
         chart = user.get("chart", {})
         hd = user.get("hd", {})
-        chart_str = chart.get("raw", json.dumps(chart, ensure_ascii=False))
-        hd_str = hd.get("raw", json.dumps(hd, ensure_ascii=False))
-        hd_library_context = get_hd_context(hd)
-        variables_context = get_phs_context(hd)
-
         # Блоки которые уже были разобраны
         seen_blocks = user.get("blocks_seen", [])
         if seen_blocks:
@@ -644,18 +674,13 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
         else:
             blocks_note = ""
 
-        context = (
-            f"\n\nКАРТА ПОЛЬЗОВАТЕЛЯ (астрология):\n{chart_str}"
-            f"\n\nHD ПОЛЬЗОВАТЕЛЯ (сырые данные):\n{hd_str}"
-            f"\n\nHD БИБЛИОТЕКА (описания типа, авторитета, центров, каналов, ворот):\n{hd_library_context}"
-            f"\n\nHD ПЕРЕМЕННЫЕ (отдельно от линий; тело, среда, взгляд, мотивация):\n{variables_context}"
-            f"{blocks_note}"
-        )
+        context = _anonymized_ai_context(chart, hd) + blocks_note
 
-    # Контекст карты добавляем к текущему запросу, а не дублируем его во всей
-    # истории. При этом сохраняем fallback между настроенными провайдерами.
-    request_history = history[-12:] + [
-        {"role": "user", "content": message + context if not history else message}
+    # Каждый зал снова получает рассчитанную карту. Раньше контекст добавлялся
+    # только к первому запросу, и следующие кнопки порождали общий текст.
+    short_history = history[-12:] if include_history else []
+    request_history = short_history + [
+        {"role": "user", "content": message + context}
     ]
 
     reply = ""
@@ -707,15 +732,18 @@ def _ask_claude_sync(user_id: int, message: str) -> str:
         details = " | ".join(provider_errors) if provider_errors else "no configured providers"
         raise RuntimeError(f"All AI providers failed: {details}")
 
-    history = request_history
-    history.append({"role": "assistant", "content": reply})
-
-    users[user_id]["history"] = history[-12:]
+    # Сохраняем диалог без 30–40 тысяч знаков расчётного контекста. Иначе при
+    # каждом новом нажатии одна и та же карта многократно раздувала запрос.
+    saved_history = short_history + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": reply},
+    ]
+    users[user_id]["history"] = saved_history[-12:]
     return reply
 
-async def ask_claude(user_id: int, message: str) -> str:
+async def ask_claude(user_id: int, message: str, include_history: bool = True) -> str:
     return await asyncio.wait_for(
-        asyncio.to_thread(_ask_claude_sync, user_id, message),
+        asyncio.to_thread(_ask_claude_sync, user_id, message, include_history),
         timeout=AI_RESPONSE_TIMEOUT_SECONDS,
     )
 
@@ -771,7 +799,11 @@ def _type_hint(type_text: str) -> str:
 
 
 def ready_block_reading(uid: int, block: str) -> str:
-    """Готовый разбор из уже рассчитанной карты без сети и внешнего ИИ."""
+    """Запрещённый прежний путь: общий текст нельзя выдавать за расчёт."""
+    raise RuntimeError("generic personal readings are forbidden; use BLOCK_PROMPTS")
+
+    # Исторический текст ниже оставлен только как материал для редакторской
+    # сверки. До отправки пользователю он технически недостижим.
     user = users.get(uid, {})
     hd_raw = str(user.get("hd", {}).get("raw", ""))
     type_text = _hd_label(hd_raw, "ТИП")
@@ -2026,7 +2058,8 @@ BLOCK_PROMPTS = {
 Это базовый портрет, поэтому не уходи в деньги, здоровье, прогнозы и подробности отношений.
 Открой разбор формулой «На Олимпе ты похож(а) на…», но сразу объясни, что это
 роль для этой темы, а не вечный ярлык и не буквальное назначение богом.
-Используй: способ действовать и принимать решения; обе линии профиля из библиотеки; все устойчивые и открытые центры; все активации планет и тексты линий; Солнце, Луну, Асцендент, Меркурий, Венеру, Марс; доминирующие планеты и рассчитанные аспекты.
+Используй: способ действовать и принимать решения; обе линии профиля из библиотеки; сквозной сюжет карты из четырёх расчётных опор; все устойчивые и открытые центры; все активации планет и тексты линий; Солнце, Луну, Асцендент, Меркурий, Венеру, Марс; доминирующие планеты и рассчитанные аспекты.
+Сквозной сюжет не называй «крестом», не выводи номера и не выдавай его за приговор: переведи в повторяющийся жизненный мотив.
 Структура: как человек входит в действие; как его видят; что у него получается естественно; один точный внутренний конфликт; что обычно ошибочно принимают за его слабость.
 5–6 абзацев. Не повторяй формулировки из ранее разобранных блоков.
 """,
@@ -2774,9 +2807,22 @@ async def ask_oracle_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def deliver_block_reading(message_obj, uid: int, block: str) -> None:
-    """Выдаёт законченный разбор, не зависящий от внешней модели."""
+    """Выдаёт только расчёт по методологии выбранного зала."""
     try:
-        await safe_send(message_obj, ready_block_reading(uid, block), parse_mode=None)
+        methodology = BLOCK_PROMPTS.get(block)
+        if not methodology:
+            raise RuntimeError(f"missing methodology for {block}")
+        if not users.get(uid, {}).get("chart") or not users.get(uid, {}).get("hd"):
+            raise RuntimeError("calculated natal chart or bodygraph is missing")
+
+        reply = await ask_claude(uid, methodology, include_history=False)
+        paragraphs = [part.strip() for part in reply.split("\n\n") if part.strip()]
+        if len(paragraphs) < 4 or len(reply.strip()) < 900:
+            raise RuntimeError("methodology reply is incomplete")
+        if _public_text_has_technical_leak(reply):
+            raise RuntimeError("technical terminology leaked into methodology reply")
+
+        await safe_send(message_obj, reply, parse_mode=None)
         db_add_block(uid, block)
         users.setdefault(uid, {}).setdefault("blocks_seen", [])
         if block not in users[uid]["blocks_seen"]:
@@ -2787,7 +2833,7 @@ async def deliver_block_reading(message_obj, uid: int, block: str) -> None:
     except Exception:
         print(f"ERROR block reading {block}: {traceback.format_exc()}", flush=True)
         await message_obj.reply_text(
-            "Не получилось отправить расчёт. Нажми «Повторить» — карта уже сохранена.",
+            "Расчёт по этому залу не завершился. Я не буду заменять его общим текстом: нажми «Повторить», чтобы собрать именно этот разбор.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↻ Повторить", callback_data=block)],
                 [InlineKeyboardButton("← На Олимп", callback_data="back_to_menu")],
@@ -3128,7 +3174,8 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return CHAT
 
-    # Не ждём внешний ИИ: разбор строится из сохранённой личной карты.
+    # Кнопка отвечает сразу, а полный расчёт по своей методологии собирается в
+    # фоне. Универсальный текст здесь запрещён.
     pending_key = (uid, query.data)
     if pending_key in pending_block_readings:
         await query.message.reply_text("Этот зал уже рассчитывается. Послание придёт отдельным сообщением.")

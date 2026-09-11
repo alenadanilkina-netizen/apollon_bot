@@ -104,6 +104,17 @@ def main() -> None:
     assert not unhandled, f"unhandled callback buttons: {sorted(unhandled)}"
     assert "asyncio.create_task(" in source_text
     assert "deliver_block_reading" in source_text
+    assert "reply = await ask_claude(uid, methodology, include_history=False)" in source_text
+    assert "ready_block_reading(uid, block)" not in source_text
+    assert "generic personal readings are forbidden" in source_text
+    assert "Я не буду заменять его общим текстом" in source_text
+    assert "get_cross_context(hd)" in source_text
+    assert 'call_mcp_async("natal_chart", params)' in source_text
+    assert 'call_mcp_async("human_design", params)' in source_text
+
+    server_text = (ROOT / "server.py").read_text(encoding="utf-8")
+    assert "import swisseph as swe" in server_text
+    assert "swe.FLG_SWIEPH" in server_text
 
     print(
         "OK: 64 cards, 384 lines, birth parser and "

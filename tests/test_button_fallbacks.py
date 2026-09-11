@@ -34,14 +34,34 @@ async def main() -> None:
     }
     original_send = bot.safe_send
     original_save_consent = bot.db_save_consent
+    original_ask = bot.ask_claude
     captured = []
+    prompts = []
 
     async def capture_send(_message, text, **kwargs):
         captured.append((text, kwargs))
 
+    async def methodology_reply(_uid, prompt, include_history=True):
+        assert include_history is False
+        prompts.append(prompt)
+        label = next(
+            line.removeprefix("ЛИНЗА БЛОКА: ").strip(".")
+            for line in prompt.splitlines()
+            if line.startswith("ЛИНЗА БЛОКА:")
+        )
+        return "\n\n".join([
+            f"{label}: первый расчётный вывод переведён в наблюдаемую жизненную ситуацию без учебного жаргона. Здесь достаточно конкретики, чтобы проверить мысль на практике, а не принять её за красивую формулу.",
+            "Второй абзац связывает факты карты с отдельной темой этого зала. Он не повторяет общий портрет и не переносит чужой сценарий в этот разбор.",
+            "Третий абзац показывает напряжение: где сильная сторона может стать перегрузкой, поспешным решением или неясной договорённостью. Это не диагноз и не приговор.",
+            "Четвёртый абзац возвращает разговор к действию, которое можно наблюдать в ближайшей реальной ситуации: в проекте, разговоре или выборе условий.",
+            "Пятый абзац завершает именно выбранную тему и сохраняет расстояние между расчётным фактом и его символической интерпретацией. Поэтому текст не превращается в ярлык или обещание события.",
+            "Боги предлагают не торопиться с выводом: сначала посмотри, как эта мысль выдержит обычную жизнь, а не только красивую беседу на Олимпе.",
+        ])
+
     try:
-        # Каждая кнопка отдаёт завершённый расчёт без внешнего ИИ.
+        # Каждая кнопка обязана использовать свою методологию, а не общий шаблон.
         bot.safe_send = capture_send
+        bot.ask_claude = methodology_reply
         readings = {}
         for block in bot.BLOCK_PROMPTS:
             query = FakeQuery(uid, block)
@@ -55,6 +75,15 @@ async def main() -> None:
             assert "Алёна" not in text
             assert kwargs["parse_mode"] is None
         assert len(set(readings.values())) == len(readings)
+        assert len(prompts) == len(bot.BLOCK_PROMPTS)
+        assert len(set(prompts)) == len(bot.BLOCK_PROMPTS)
+        assert all("ЛИНЗА БЛОКА:" in prompt for prompt in prompts)
+        try:
+            bot.ready_block_reading(uid, "block_identity")
+        except RuntimeError as exc:
+            assert "forbidden" in str(exc)
+        else:
+            raise AssertionError("generic personal reading path must remain forbidden")
 
         captured.clear()
         query = FakeQuery(uid, "forecast_month")
@@ -84,17 +113,23 @@ async def main() -> None:
             "hd": {"raw": "ТИП: Генератор\nАВТОРИТЕТ: Сакральный"},
             "persona_gender": "m",
         }
-        isolated_reading = bot.ready_block_reading(uid, "block_identity")
-        assert "Алёна" not in isolated_reading
-        assert "1981" not in isolated_reading
+        cleaned = bot._anonymized_calculation(
+            "Дата: 23.02.1981 09:50 UTC+1\nКоординаты: 52.4443°N 15.1168°E\n"
+            "АСЦ: Рыбы 5°20'\nСолнце: Рыбы 3°11'"
+        )
+        assert "1981" not in cleaned
+        assert "09:50" not in cleaned
+        assert "52.4443" not in cleaned
+        assert "АСЦ" in cleaned
         assert bot.olympian_alias(uid) != bot.olympian_alias(other_uid)
     finally:
         bot.safe_send = original_send
         bot.db_save_consent = original_save_consent
+        bot.ask_claude = original_ask
         bot.users.pop(uid, None)
         bot.users.pop(271828, None)
 
-    print("OK: every public block and forecast return without external AI or leaked names")
+    print("OK: every public block uses its methodology, preserves paragraphs and strips birth identifiers")
 
 
 if __name__ == "__main__":
