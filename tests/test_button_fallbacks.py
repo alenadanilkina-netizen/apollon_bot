@@ -66,6 +66,7 @@ async def main() -> None:
         for block in bot.BLOCK_PROMPTS:
             query = FakeQuery(uid, block)
             await bot.handle_button(SimpleNamespace(callback_query=query), None)
+            assert bot.active_background_tasks, "background reading task lost its strong reference"
             await asyncio.sleep(0)
             assert query.message.replies[0][0] == bot.block_loading_message(block)
             assert captured, block
@@ -78,6 +79,8 @@ async def main() -> None:
         assert len(prompts) == len(bot.BLOCK_PROMPTS)
         assert len(set(prompts)) == len(bot.BLOCK_PROMPTS)
         assert all("ЛИНЗА БЛОКА:" in prompt for prompt in prompts)
+        await asyncio.sleep(0)
+        assert not bot.active_background_tasks
         try:
             bot.ready_block_reading(uid, "block_identity")
         except RuntimeError as exc:
