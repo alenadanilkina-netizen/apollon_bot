@@ -3187,10 +3187,21 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     pending_block_readings.add(pending_key)
     await query.message.reply_text(block_loading_message(query.data))
-    task = asyncio.create_task(
-        deliver_block_reading(query.message, uid, query.data),
-        name=f"olympus-reading-{uid}-{query.data}",
-    )
+    task_name = f"olympus-reading-{uid}-{query.data}"
+    if ctx is not None and getattr(ctx, "application", None) is not None:
+        # Application.create_task регистрирует задачу в жизненном цикле
+        # python-telegram-bot и передаёт её исключения общему обработчику.
+        task = ctx.application.create_task(
+            deliver_block_reading(query.message, uid, query.data),
+            update=update,
+            name=task_name,
+        )
+    else:
+        # Используется только в изолированных локальных тестах.
+        task = asyncio.create_task(
+            deliver_block_reading(query.message, uid, query.data),
+            name=task_name,
+        )
     active_background_tasks.add(task)
     task.add_done_callback(active_background_tasks.discard)
     users[uid]["menu_shown"] = True
@@ -3429,9 +3440,14 @@ def main():
     # второй проект должен завершиться до обращения к Telegram API.
     railway_project = os.environ.get("RAILWAY_PROJECT_NAME", "").strip()
     railway_project_id = os.environ.get("RAILWAY_PROJECT_ID", "").strip()
+    running_on_railway = any(
+        os.environ.get(marker, "").strip()
+        for marker in ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_SERVICE_ID", "RAILWAY_DEPLOYMENT_ID")
+    )
     wrong_named_project = railway_project and railway_project != "hearty-stillness"
     wrong_project_id = railway_project_id and railway_project_id != ACTIVE_RAILWAY_PROJECT_ID
-    if wrong_named_project or wrong_project_id:
+    missing_project_identity = running_on_railway and not railway_project_id
+    if wrong_named_project or wrong_project_id or missing_project_identity:
         print(
             "Bot startup skipped: this repository is active only in "
             f"hearty-stillness (current project: {railway_project or railway_project_id})."

@@ -9,13 +9,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(project_id: str) -> str:
+def run(project_id: str, **extra_env: str) -> str:
     env = os.environ.copy()
     env.update({
         "RAILWAY_PROJECT_ID": project_id,
         "TELEGRAM_TOKEN": "",
         "ANTHROPIC_API_KEY": "",
     })
+    env.update(extra_env)
     result = subprocess.run(
         [sys.executable, "bot.py"], cwd=ROOT, env=env,
         text=True, capture_output=True, check=True,
@@ -30,6 +31,9 @@ def main() -> None:
     active = run("9b74e8cc-9d3c-403e-8c31-92d944ad5e1a")
     assert "Нужен TELEGRAM_TOKEN" in active
     assert "startup skipped" not in active
+
+    unidentified = run("", RAILWAY_SERVICE_ID="some-railway-service")
+    assert "startup skipped" in unidentified
     print("OK: only hearty-stillness can start Telegram polling")
 
 

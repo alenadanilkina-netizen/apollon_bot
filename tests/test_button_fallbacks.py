@@ -24,6 +24,16 @@ class FakeQuery:
         return None
 
 
+class FakeApplication:
+    def __init__(self) -> None:
+        self.tasks = []
+
+    def create_task(self, coroutine, update=None, *, name=None):
+        task = asyncio.create_task(coroutine, name=name)
+        self.tasks.append((task, update))
+        return task
+
+
 async def main() -> None:
     uid = 314159
     bot.users[uid] = {
@@ -58,14 +68,54 @@ async def main() -> None:
             "Боги предлагают не торопиться с выводом: сначала посмотри, как эта мысль выдержит обычную жизнь, а не только красивую беседу на Олимпе.",
         ])
 
+    async def delayed_methodology_reply(_uid, prompt, include_history=True):
+        delayed_started.set()
+        await delayed_release.wait()
+        return await methodology_reply(_uid, prompt, include_history)
+
     try:
         # Каждая кнопка обязана использовать свою методологию, а не общий шаблон.
         bot.safe_send = capture_send
+        # Реальный провайдер отвечает не мгновенно. Проверяем, что после
+        # возврата обработчика Telegram задача не исчезает, повторное нажатие
+        # не запускает второй расчёт, а итог всё равно доходит пользователю.
+        delayed_started = asyncio.Event()
+        delayed_release = asyncio.Event()
+        bot.ask_claude = delayed_methodology_reply
+        delayed_query = FakeQuery(uid, "block_identity")
+        delayed_application = FakeApplication()
+        delayed_context = SimpleNamespace(application=delayed_application)
+        await bot.handle_button(SimpleNamespace(callback_query=delayed_query), delayed_context)
+        await asyncio.wait_for(delayed_started.wait(), timeout=1)
+        delayed_task, delayed_update = delayed_application.tasks[0]
+        assert delayed_update.callback_query is delayed_query
+        assert not delayed_task.done()
+        assert delayed_task in bot.active_background_tasks
+        assert (uid, "block_identity") in bot.pending_block_readings
+
+        duplicate_query = FakeQuery(uid, "block_identity")
+        await bot.handle_button(SimpleNamespace(callback_query=duplicate_query), delayed_context)
+        assert len(delayed_application.tasks) == 1
+        assert "уже рассчитывается" in duplicate_query.message.replies[-1][0]
+
+        delayed_release.set()
+        await asyncio.wait_for(delayed_task, timeout=1)
+        await asyncio.sleep(0)
+        assert captured and len(captured.pop(0)[0]) > 900
+        assert delayed_task not in bot.active_background_tasks
+        assert (uid, "block_identity") not in bot.pending_block_readings
+
         bot.ask_claude = methodology_reply
+        prompts.clear()
         readings = {}
         for block in bot.BLOCK_PROMPTS:
             query = FakeQuery(uid, block)
-            await bot.handle_button(SimpleNamespace(callback_query=query), None)
+            application = FakeApplication()
+            context = SimpleNamespace(application=application)
+            await bot.handle_button(SimpleNamespace(callback_query=query), context)
+            assert len(application.tasks) == 1
+            task, task_update = application.tasks[0]
+            assert task_update.callback_query is query
             assert bot.active_background_tasks, "background reading task lost its strong reference"
             await asyncio.sleep(0)
             assert query.message.replies[0][0] == bot.block_loading_message(block)
