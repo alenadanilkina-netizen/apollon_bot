@@ -307,10 +307,6 @@ users = {}  # user_id → {name, birth_data, chart, hd, history, trial_days}
 # Один пользователь может открыть несколько разных залов, но повторное нажатие
 # на одну и ту же кнопку не должно запускать параллельные одинаковые запросы.
 pending_block_readings: set[tuple[int, str]] = set()
-# asyncio хранит только слабые ссылки на созданные задачи. Сильная ссылка здесь
-# не даёт долгому ИИ-разбору исчезнуть после того, как обработчик кнопки уже
-# вернул служебное сообщение «Собираю…».
-active_background_tasks: set[asyncio.Task] = set()
 
 # Telegram ограничивает текст одного сообщения 4096 символами. Кроме того,
 # Claude иногда возвращает Markdown, который не проходит строгий парсер Telegram
@@ -3178,8 +3174,9 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return CHAT
 
-    # Кнопка отвечает сразу, а полный расчёт по своей методологии собирается в
-    # фоне. Универсальный текст здесь запрещён.
+    # Кнопка подтверждается до расчёта, но callback-обработчик сам отвечает за
+    # доставку результата. Вынос этого вызова в create_task уже приводил в
+    # production к заставке «Собираю…» без последующего сообщения.
     pending_key = (uid, query.data)
     if pending_key in pending_block_readings:
         await query.message.reply_text("Этот зал уже рассчитывается. Послание придёт отдельным сообщением.")
@@ -3187,23 +3184,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     pending_block_readings.add(pending_key)
     await query.message.reply_text(block_loading_message(query.data))
-    task_name = f"olympus-reading-{uid}-{query.data}"
-    if ctx is not None and getattr(ctx, "application", None) is not None:
-        # Application.create_task регистрирует задачу в жизненном цикле
-        # python-telegram-bot и передаёт её исключения общему обработчику.
-        task = ctx.application.create_task(
-            deliver_block_reading(query.message, uid, query.data),
-            update=update,
-            name=task_name,
-        )
-    else:
-        # Используется только в изолированных локальных тестах.
-        task = asyncio.create_task(
-            deliver_block_reading(query.message, uid, query.data),
-            name=task_name,
-        )
-    active_background_tasks.add(task)
-    task.add_done_callback(active_background_tasks.discard)
+    await deliver_block_reading(query.message, uid, query.data)
     users[uid]["menu_shown"] = True
     return CHAT
 

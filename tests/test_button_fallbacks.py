@@ -24,16 +24,6 @@ class FakeQuery:
         return None
 
 
-class FakeApplication:
-    def __init__(self) -> None:
-        self.tasks = []
-
-    def create_task(self, coroutine, update=None, *, name=None):
-        task = asyncio.create_task(coroutine, name=name)
-        self.tasks.append((task, update))
-        return task
-
-
 async def main() -> None:
     uid = 314159
     bot.users[uid] = {
@@ -76,33 +66,28 @@ async def main() -> None:
     try:
         # Каждая кнопка обязана использовать свою методологию, а не общий шаблон.
         bot.safe_send = capture_send
-        # Реальный провайдер отвечает не мгновенно. Проверяем, что после
-        # возврата обработчика Telegram задача не исчезает, повторное нажатие
-        # не запускает второй расчёт, а итог всё равно доходит пользователю.
+        # Реальный провайдер отвечает не мгновенно. Проверяем, что callback
+        # остаётся ответственным за доставку до самого результата, повторное
+        # нажатие не запускает второй расчёт, а итог доходит пользователю.
         delayed_started = asyncio.Event()
         delayed_release = asyncio.Event()
         bot.ask_claude = delayed_methodology_reply
         delayed_query = FakeQuery(uid, "block_identity")
-        delayed_application = FakeApplication()
-        delayed_context = SimpleNamespace(application=delayed_application)
-        await bot.handle_button(SimpleNamespace(callback_query=delayed_query), delayed_context)
+        delayed_update = SimpleNamespace(callback_query=delayed_query)
+        handler_task = asyncio.create_task(bot.handle_button(delayed_update, None))
         await asyncio.wait_for(delayed_started.wait(), timeout=1)
-        delayed_task, delayed_update = delayed_application.tasks[0]
-        assert delayed_update.callback_query is delayed_query
-        assert not delayed_task.done()
-        assert delayed_task in bot.active_background_tasks
+        assert not handler_task.done()
         assert (uid, "block_identity") in bot.pending_block_readings
+        assert delayed_query.message.replies[0][0] == bot.block_loading_message("block_identity")
 
         duplicate_query = FakeQuery(uid, "block_identity")
-        await bot.handle_button(SimpleNamespace(callback_query=duplicate_query), delayed_context)
-        assert len(delayed_application.tasks) == 1
+        await bot.handle_button(SimpleNamespace(callback_query=duplicate_query), None)
         assert "уже рассчитывается" in duplicate_query.message.replies[-1][0]
 
         delayed_release.set()
-        await asyncio.wait_for(delayed_task, timeout=1)
+        await asyncio.wait_for(handler_task, timeout=1)
         await asyncio.sleep(0)
         assert captured and len(captured.pop(0)[0]) > 900
-        assert delayed_task not in bot.active_background_tasks
         assert (uid, "block_identity") not in bot.pending_block_readings
 
         bot.ask_claude = methodology_reply
@@ -110,14 +95,7 @@ async def main() -> None:
         readings = {}
         for block in bot.BLOCK_PROMPTS:
             query = FakeQuery(uid, block)
-            application = FakeApplication()
-            context = SimpleNamespace(application=application)
-            await bot.handle_button(SimpleNamespace(callback_query=query), context)
-            assert len(application.tasks) == 1
-            task, task_update = application.tasks[0]
-            assert task_update.callback_query is query
-            assert bot.active_background_tasks, "background reading task lost its strong reference"
-            await asyncio.sleep(0)
+            await bot.handle_button(SimpleNamespace(callback_query=query), None)
             assert query.message.replies[0][0] == bot.block_loading_message(block)
             assert captured, block
             text, kwargs = captured.pop(0)
@@ -129,14 +107,26 @@ async def main() -> None:
         assert len(prompts) == len(bot.BLOCK_PROMPTS)
         assert len(set(prompts)) == len(bot.BLOCK_PROMPTS)
         assert all("ЛИНЗА БЛОКА:" in prompt for prompt in prompts)
-        await asyncio.sleep(0)
-        assert not bot.active_background_tasks
         try:
             bot.ready_block_reading(uid, "block_identity")
         except RuntimeError as exc:
             assert "forbidden" in str(exc)
         else:
             raise AssertionError("generic personal reading path must remain forbidden")
+
+        # Сбой внешнего провайдера не имеет права оставить только заставку.
+        async def failed_methodology_reply(_uid, _prompt, include_history=True):
+            raise TimeoutError("provider unavailable")
+
+        bot.ask_claude = failed_methodology_reply
+        failed_query = FakeQuery(uid, "block_mission")
+        await bot.handle_button(SimpleNamespace(callback_query=failed_query), None)
+        assert failed_query.message.replies[0][0] == bot.block_loading_message("block_mission")
+        assert "не завершился" in failed_query.message.replies[-1][0]
+        failed_markup = failed_query.message.replies[-1][1]["reply_markup"]
+        assert failed_markup.inline_keyboard[0][0].callback_data == "block_mission"
+        assert (uid, "block_mission") not in bot.pending_block_readings
+        bot.ask_claude = methodology_reply
 
         captured.clear()
         query = FakeQuery(uid, "forecast_month")

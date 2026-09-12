@@ -102,12 +102,10 @@ def main() -> None:
         if not _is_handled_callback(callback, source_text)
     }
     assert not unhandled, f"unhandled callback buttons: {sorted(unhandled)}"
-    assert "asyncio.create_task(" in source_text
     assert "deliver_block_reading" in source_text
-    assert "active_background_tasks.add(task)" in source_text
-    assert "task.add_done_callback(active_background_tasks.discard)" in source_text
-    assert "ctx.application.create_task(" in source_text
-    assert "update=update" in source_text
+    assert "await deliver_block_reading(query.message, uid, query.data)" in source_text
+    assert "ctx.application.create_task(" not in source_text
+    assert "active_background_tasks" not in source_text
     assert "reply = await ask_claude(uid, methodology, include_history=False)" in source_text
     assert "ready_block_reading(uid, block)" not in source_text
     assert "generic personal readings are forbidden" in source_text
