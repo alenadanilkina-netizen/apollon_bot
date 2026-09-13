@@ -24,6 +24,16 @@ class FakeQuery:
         return None
 
 
+class ClosedStream:
+    """Имитирует stdout/stderr Railway в момент остановки контейнера."""
+
+    def write(self, _text):
+        raise ValueError("I/O operation on closed file")
+
+    def flush(self):
+        raise ValueError("I/O operation on closed file")
+
+
 async def main() -> None:
     uid = 314159
     bot.users[uid] = {
@@ -35,6 +45,7 @@ async def main() -> None:
     original_send = bot.safe_send
     original_save_consent = bot.db_save_consent
     original_ask = bot.ask_claude
+    original_stderr = bot.sys.stderr
     captured = []
     prompts = []
 
@@ -165,10 +176,22 @@ async def main() -> None:
         assert "52.4443" not in cleaned
         assert "АСЦ" in cleaned
         assert bot.olympian_alias(uid) != bot.olympian_alias(other_uid)
+
+        # Даже при закрытом системном потоке error handler не должен падать
+        # поверх исходной ошибки и оставлять человека без ответа.
+        bot.sys.stderr = ClosedStream()
+        error_message = FakeMessage()
+        await bot.telegram_error_handler(
+            SimpleNamespace(effective_message=error_message),
+            SimpleNamespace(error=RuntimeError("source callback failure")),
+        )
+        assert error_message.replies
+        assert "не смогла закончить расчёт" in error_message.replies[0][0]
     finally:
         bot.safe_send = original_send
         bot.db_save_consent = original_save_consent
         bot.ask_claude = original_ask
+        bot.sys.stderr = original_stderr
         bot.users.pop(uid, None)
         bot.users.pop(271828, None)
 

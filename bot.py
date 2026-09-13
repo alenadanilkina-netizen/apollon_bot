@@ -3400,8 +3400,22 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def telegram_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    """Не оставляет нажатую кнопку без ответа при неожиданной ошибке."""
-    print(f"ERROR unhandled Telegram update: {ctx.error}", flush=True)
+    """Отправляет пользователю понятный ответ и безопасно пишет причину в лог.
+
+    Обработчик ошибок вызывается уже после сбоя другой функции. Поэтому он не
+    должен сам бросать исключение: например, ``print(..., flush=True)`` может
+    упасть при завершении процесса, когда stdout Railway уже закрыт.
+    """
+    error_text = "".join(
+        traceback.format_exception(type(ctx.error), ctx.error, ctx.error.__traceback__)
+    ) if ctx.error else "Unknown Telegram update error"
+    try:
+        sys.stderr.write(f"ERROR unhandled Telegram update:\n{error_text}\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        # Во время остановки контейнера stdout/stderr может быть уже закрыт.
+        # Нельзя из-за этого терять fallback-сообщение пользователю.
+        pass
     try:
         message = getattr(update, "effective_message", None)
         if message:
@@ -3410,7 +3424,11 @@ async def telegram_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE)
                 "Попробуй ещё раз через минуту или начни с /start."
             )
     except Exception as exc:
-        print(f"ERROR sending Telegram fallback: {exc}", flush=True)
+        try:
+            sys.stderr.write(f"ERROR sending Telegram fallback: {exc!r}\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
 
 
 # ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
