@@ -53,8 +53,17 @@ async def main() -> None:
         captured.append((text, kwargs))
 
     async def methodology_reply(_uid, prompt, include_history=True):
-        assert include_history is False
         prompts.append(prompt)
+        if "Сделай ясный прогноз" in prompt:
+            return "\n\n".join([
+                "Период собран из точных расчётных срезов: здесь видны даты, на которых держится прогноз, а не общая формула для всех.",
+                "Первый отрезок показывает текущий ритм и задачу, которую стоит довести до ясной договорённости без лишней спешки.",
+                "После следующей границы лунарного периода меняется фокус: полезно проверить, что из начатого действительно можно продолжать.",
+                "В работе это видно по срокам и распределению сил; в отношениях — по тому, где разговор требует конкретного ответа; внутри — по возвращению к своему темпу.",
+                "Не пытайся сделать из этого периода экзамен на идеальность. Достаточно заметить, в каком месте ты меняешь решение, потому что появились новые факты, а не потому что стало тревожно.",
+                "Проверь этот вывод на ближайшем выборе и не выдавай символическую карту за обещание события. Боги советуют сначала сверить курс, а потом поднимать паруса.",
+            ])
+        assert include_history is False
         label = next(
             line.removeprefix("ЛИНЗА БЛОКА: ").strip(".")
             for line in prompt.splitlines()
@@ -142,9 +151,12 @@ async def main() -> None:
         captured.clear()
         query = FakeQuery(uid, "forecast_month")
         await bot.handle_button(SimpleNamespace(callback_query=query), None)
-        assert captured and "ближайший месяц" in captured[0][0]
-        assert captured[0][1]["parse_mode"] is None
+        assert captured and len(captured[0][0]) > 500
+        assert captured[0][1].get("parse_mode") is None
         assert query.message.replies[-1][1]["reply_markup"] is bot.FORECAST_KEYBOARD
+        forecast_prompt = prompts[-1]
+        assert "ТЕКУЩИЙ ЛУНАР" in forecast_prompt
+        assert "СЛЕДУЮЩИЙ ЛУНАР" in forecast_prompt
 
         # Политика одна: сначала открыть, затем отдельно принять.
         bot.users[uid] = {"history": []}

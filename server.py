@@ -7,8 +7,13 @@ Astrology + Human Design MCP Server
 
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
+# Этот файл импортируется ботом как библиотека расчётов. Нельзя заменять
+# глобальные stdout/stdin процесса при импорте: прежний TextIOWrapper мог
+# закрыть поток Railway при финализации и после этого падал даже error handler
+# Telegram. Кодировка нужна только standalone JSON-RPC-серверу.
+if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", write_through=True)
+    sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
 import json
 import math
 import ctypes
@@ -416,6 +421,67 @@ def tool_natal_chart(args):
         r = "℞" if pdata["retro"] else ""
         lines.append(f"{pname:<12} {sign:<13} {d:2d}°{m:02d}'     {nak:<18} {pada}     {r}")
 
+    return "\n".join(lines)
+
+
+def tool_synastry(args):
+    """Синастрия: вычисляемые межкарточные аспекты и наложения домов.
+
+    Это не "оценка совместимости" и не текст от модели. Сначала строятся две
+    тропические натальные карты Swiss Ephemeris, затем фиксируются только
+    фактические связи между ними. Интерпретация остаётся отдельным слоем.
+    """
+    def chart(prefix: str):
+        jd = birth_to_jd(
+            int(args[f"{prefix}_year"]), int(args[f"{prefix}_month"]),
+            int(args[f"{prefix}_day"]), int(args[f"{prefix}_hour"]),
+            int(args.get(f"{prefix}_minute", 0)), float(args[f"{prefix}_timezone"]),
+        )
+        cusps, _asc, _mc = calc_houses(
+            jd, float(args[f"{prefix}_lat"]), float(args[f"{prefix}_lon"])
+        )
+        return calc_planets(jd, sidereal=False), cusps
+
+    a_planets, a_cusps = chart("a")
+    b_planets, b_cusps = chart("b")
+    name_a = str(args.get("a_label", "Человек 1"))
+    name_b = str(args.get("b_label", "Человек 2"))
+    aspects = [(0, "соединение", 8), (60, "секстиль", 5),
+               (90, "квадрат", 6), (120, "трин", 7), (180, "оппозиция", 7)]
+    # Светила и личные планеты образуют читаемое ядро отношений; медленные
+    # планеты остаются в отдельном наложении, чтобы не раздуть текст поколенческими связями.
+    personal = ("Солнце", "Луна", "Меркурий", "Венера", "Марс")
+    lines = [f"═══ СИНАСТРИЯ: {name_a} и {name_b} ═══", "", "── МЕЖКАРТОЧНЫЕ СВЯЗИ ──"]
+    found = 0
+    for a_name in personal:
+        for b_name in personal:
+            delta = abs(a_planets[a_name]["lon"] - b_planets[b_name]["lon"]) % 360
+            if delta > 180:
+                delta = 360 - delta
+            for angle, label, orb in aspects:
+                deviation = abs(delta - angle)
+                if deviation <= orb:
+                    lines.append(
+                        f"{name_a}: {a_name} — {name_b}: {b_name}: "
+                        f"{label} (орб {deviation:.2f}°)"
+                    )
+                    found += 1
+                    break
+    if not found:
+        lines.append("Нет точных мажорных связей между светилами и личными планетами в заданных орбисах.")
+
+    lines.extend(["", "── НАЛОЖЕНИЕ В ДОМА ──"])
+    for planet in personal:
+        a_in_b = get_house_num(a_planets[planet]["lon"], b_cusps)
+        b_in_a = get_house_num(b_planets[planet]["lon"], a_cusps)
+        lines.append(
+            f"{name_a}: {planet} в {a_in_b}-м доме {name_b}; "
+            f"{name_b}: {planet} в {b_in_a}-м доме {name_a}."
+        )
+    lines.extend([
+        "", "Метод: тропическая карта, система домов Плацидус, Swiss Ephemeris.",
+        "Это расчётная основа; она не определяет судьбу пары и не заменяет разговор о границах и договорённостях.",
+    ])
     return "\n".join(lines)
 
 
@@ -1387,6 +1453,7 @@ TOOLS_SCHEMA = [
 
 TOOL_HANDLERS = {
     "natal_chart":   tool_natal_chart,
+    "synastry":      tool_synastry,
     "human_design":  tool_human_design,
     "solar_return":  tool_solar_return,
     "lunar_return":  tool_lunar_return,

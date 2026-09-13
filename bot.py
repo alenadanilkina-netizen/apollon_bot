@@ -402,20 +402,20 @@ async def calculate_chart(birth: dict) -> tuple[dict, dict]:
     return natal, hd
 
 
-def build_compatibility_prompt(name1: str, name2: str, rel_type: str,
-                               time_note: str, chart1: str, hd1: str,
-                               chart2: str, hd2: str) -> str:
+def build_compatibility_prompt(rel_type: str, time_note: str,
+                               chart1: str, hd1: str, chart2: str, hd2: str,
+                               synastry: str) -> str:
     """Собирает промпт после отдельного расчёта обеих карт.
 
     Составная карта рассчитана кодом в server.py. Модель получает готовые
     категории connection chart и переводит их в человеческий язык.
     """
-    hd_connection = _mcp_mod.build_hd_compatibility(hd1, hd2, name1, name2)
+    hd_connection = _mcp_mod.build_hd_compatibility(hd1, hd2, "Человек А", "Человек Б")
     hd_context1 = get_hd_context({"raw": hd1})
     hd_context2 = get_hd_context({"raw": hd2})
     return f"""Сделай точный разбор совместимости для типа отношений: {rel_type}.
 
-Люди: {name1} и {name2}{time_note}.
+Участники: Человек А и Человек Б{time_note}.
 
 Сначала используй только расчётные факты ниже. Не пересчитывай составную карту
 «по впечатлению» и не добавляй каналы, которых нет в блоке. Затем переведи их в
@@ -426,17 +426,20 @@ def build_compatibility_prompt(name1: str, name2: str, rel_type: str,
 === РАСЧЁТ СОСТАВНОЙ КАРТЫ ===
 {hd_connection}
 
-=== АСТРОЛОГИЯ {name1} ===
+=== ВЫЧИСЛЕННАЯ СИНАСТРИЯ ===
+{synastry}
+
+=== АСТРОЛОГИЯ ЧЕЛОВЕКА А ===
 {chart1}
 
-=== АСТРОЛОГИЯ {name2} ===
+=== АСТРОЛОГИЯ ЧЕЛОВЕКА Б ===
 {chart2}
 
-=== ИНДИВИДУАЛЬНЫЙ HD {name1} ===
+=== ИНДИВИДУАЛЬНЫЙ HD ЧЕЛОВЕКА А ===
 {hd1}
 {hd_context1}
 
-=== ИНДИВИДУАЛЬНЫЙ HD {name2} ===
+=== ИНДИВИДУАЛЬНЫЙ HD ЧЕЛОВЕКА Б ===
 {hd2}
 {hd_context2}
 
@@ -452,23 +455,32 @@ def build_compatibility_prompt(name1: str, name2: str, rel_type: str,
 
 Отделяй расчёт от интерпретации. Не обещай судьбу, не называй отношения
 «идеальными» или «обречёнными», не повторяй одну и ту же мысль в разных разделах.
-Обращайся к {name1} на «ты»."""
+Обращайся к человеку, который запросил разбор, на «ты» и не используй имена."""
 
 
 async def generate_compatibility_reply(uid: int, compat: dict) -> str:
-    """Посчитать вторую карту, составную HD-карту и получить итоговый текст."""
+    """Посчитать вторую карту, синастрию, составной HD и получить итоговый текст."""
     natal2, hd2 = await calculate_chart(compat["birth"])
-    name1 = users[uid].get("name", "")
-    name2 = compat["name"]
     chart1 = users[uid].get("chart", {}).get("raw", "")
     hd1 = users[uid].get("hd", {}).get("raw", "")
     chart2 = natal2.get("raw", "")
     hd2_raw = hd2.get("raw", "")
     no_time = compat.get("no_time", False)
     time_note = " (время рождения неизвестно — линии и дома приблизительны)" if no_time else ""
+    birth1 = users[uid].get("birth", {})
+    birth2 = compat["birth"]
+    synastry_raw = await call_mcp_async("synastry", {
+        "a_year": birth1["year"], "a_month": birth1["month"], "a_day": birth1["day"],
+        "a_hour": birth1["hour"], "a_minute": birth1.get("minute", 0),
+        "a_timezone": birth1["utc_offset"], "a_lat": birth1["lat"], "a_lon": birth1["lon"],
+        "b_year": birth2["year"], "b_month": birth2["month"], "b_day": birth2["day"],
+        "b_hour": birth2["hour"], "b_minute": birth2.get("minute", 0),
+        "b_timezone": birth2["utc_offset"], "b_lat": birth2["lat"], "b_lon": birth2["lon"],
+        "a_label": "Человек А", "b_label": "Человек Б",
+    })
     prompt = build_compatibility_prompt(
-        name1, name2, compat.get("type", "отношения"), time_note,
-        chart1, hd1, chart2, hd2_raw,
+        compat.get("type", "отношения"), time_note,
+        chart1, hd1, chart2, hd2_raw, synastry_raw.get("raw", str(synastry_raw)),
     )
     return await ask_claude(uid, prompt)
 
@@ -2641,6 +2653,50 @@ async def collect_transit_snapshots(period: str, birth: dict, start: datetime) -
     return "\n\n".join(snapshots)
 
 
+async def collect_lunar_month_data(birth: dict, reference: datetime) -> str:
+    """Собирает границы текущего и следующего лунаров.
+
+    Один «ближайший лунар» не объясняет человеку, где именно проходит граница
+    его месяца. Для месячной кнопки нужны оба возврата Луны: предыдущий
+    открывает текущий период, следующий — следующий сюжет.
+    """
+    return_lat = birth.get("return_lat", birth["lat"])
+    return_lon = birth.get("return_lon", birth["lon"])
+    base = {
+        "birth_year": birth["year"], "birth_month": birth["month"],
+        "birth_day": birth["day"], "birth_hour": birth["hour"],
+        "birth_minute": birth.get("minute", 0),
+        "birth_timezone": birth["utc_offset"],
+        "lat": birth["lat"], "lon": birth["lon"],
+        "return_lat": return_lat, "return_lon": return_lon,
+    }
+    # За 30 суток до опорной даты гарантированно лежит предыдущий лунар:
+    # лунный возврат занимает около 27.3 суток.
+    previous_start = reference - timedelta(days=30)
+    previous = await call_mcp_async("lunar_return", {
+        **base,
+        "from_year": previous_start.year,
+        "from_month": previous_start.month,
+        "from_day": previous_start.day,
+    })
+    upcoming = await call_mcp_async("lunar_return", {
+        **base,
+        "from_year": reference.year,
+        "from_month": reference.month,
+        "from_day": reference.day,
+    })
+    location_note = (
+        "Место возврата: сохранённое место пребывания."
+        if "return_lat" in birth and "return_lon" in birth
+        else "Место возврата: место рождения (город пребывания для лунара ещё не указан)."
+    )
+    return (
+        f"{location_note}\n\n"
+        f"ТЕКУЩИЙ ЛУНАР (начался до опорной даты):\n{previous.get('raw', str(previous))}\n\n"
+        f"СЛЕДУЮЩИЙ ЛУНАР (начнётся после опорной даты):\n{upcoming.get('raw', str(upcoming))}"
+    )
+
+
 # Версия прогноза с честной границей данных. Она переопределяет старый черновик
 # выше: модель видит несколько дат и не должна превращать один срез в обещание.
 def get_forecast_prompt(period: str, transits_data: str) -> str:
@@ -2684,6 +2740,21 @@ def get_forecast_prompt(period: str, transits_data: str) -> str:
 
 6. **Действие.** Один проверяемый шаг на этот период. В финале — короткая
 ироническая реплика богов. Это символическая интерпретация, не гарантия события.
+
+ДОПОЛНИТЕЛЬНО ДЛЯ МЕСЯЦА:
+— Если переданы «ТЕКУЩИЙ ЛУНАР» и «СЛЕДУЮЩИЙ ЛУНАР», обязательно выдели два
+последовательных отрезка: от момента текущего возврата Луны до следующего и
+после следующего возврата. Назови границу датой из расчёта. Не называй это
+одним и тем же «месяцем» и не подменяй его четырьмя недельными срезами.
+— Если город пребывания не указан, честно назови это ограничением: дома
+лунарной карты построены по месту рождения.
+
+ДОПОЛНИТЕЛЬНО ДЛЯ ГОДА:
+— Используй соляр как карту годового цикла, годовые транзитные срезы и
+HD-год как отдельный календарный слой. Не выдавай возврат Сатурна, Урана или
+Хирона за событие года, если он не попадает в этот возрастной период.
+— Раздели год хотя бы на три временных отрезка, только если их границы
+следуют из переданных срезов или точного возврата.
 
 ОБЯЗАТЕЛЬНЫЕ ОГРАНИЧЕНИЯ:
 — Не выдумывай транзиты, аспекты, ворота, линии, дома, даты разворота и
@@ -3090,23 +3161,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if query.data.startswith("forecast_"):
-        # Прогноз выдаётся из уже рассчитанной карты сразу. Внешние эфемериды
-        # и ИИ больше не являются условием ответа на кнопку.
-        await safe_send(query.message, fallback_forecast_reading(uid, query.data), parse_mode=None)
-        await query.message.reply_text("Выбери другой горизонт или вернись на Олимп.", reply_markup=FORECAST_KEYBOARD)
-        return CHAT
-
         birth = users[uid].get("birth", {})
         today = datetime.now()
-        # Пользователь получает ориентир сразу. Внешние эфемериды и ИИ могут
-        # дополнить его ниже, но больше не являются условием первого ответа.
-        await safe_send(query.message, fallback_forecast_reading(uid, query.data), parse_mode=None)
         try:
-            # Расчёт не имеет права молча держать пользователя на заставке.
-            # Если один из источников эфемерид завис, ниже сработает понятный
-            # резервный прогноз.
+            await query.message.reply_text("Сверяю эфемериды и собираю расчёт периода…")
             transits_str = await asyncio.wait_for(
-                collect_transit_snapshots(query.data, birth, today), timeout=15
+                collect_transit_snapshots(query.data, birth, today), timeout=30
             )
 
             extra_str = ""
@@ -3137,15 +3197,10 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if query.data == "forecast_month":
                 try:
-                    lunar_raw = await call_mcp_async("lunar_return", {
-                        "birth_year": birth["year"], "birth_month": birth["month"],
-                        "birth_day": birth["day"], "birth_hour": birth["hour"],
-                        "birth_minute": birth.get("minute", 0),
-                        "birth_timezone": birth["utc_offset"],
-                        "lat": birth["lat"], "lon": birth["lon"],
-                        "from_year": today.year, "from_month": today.month, "from_day": today.day,
-                    })
-                    extra_str += "\n\nЛУНАР (карта месяца):\n" + lunar_raw.get("raw", str(lunar_raw))
+                    lunar_data = await asyncio.wait_for(
+                        collect_lunar_month_data(birth, today), timeout=20
+                    )
+                    extra_str += "\n\nЛУНАРНЫЕ ПЕРИОДЫ:\n" + lunar_data
                 except Exception as exc:
                     print(f"WARN forecast lunar_return: {type(exc).__name__}: {exc}", flush=True)
 

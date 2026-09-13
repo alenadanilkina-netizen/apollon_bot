@@ -113,10 +113,27 @@ def main() -> None:
     assert "get_cross_context(hd)" in source_text
     assert 'call_mcp_async("natal_chart", params)' in source_text
     assert 'call_mcp_async("human_design", params)' in source_text
+    assert "collect_lunar_month_data" in source_text
+    assert "ТЕКУЩИЙ ЛУНАР" in source_text
+    assert "СЛЕДУЮЩИЙ ЛУНАР" in source_text
+    assert 'call_mcp_async("synastry"' in source_text
+    assert "fallback_forecast_reading(uid, query.data)" not in source_text
 
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
     assert "import swisseph as swe" in server_text
     assert "swe.FLG_SWIEPH" in server_text
+    assert "def tool_synastry(args):" in server_text
+    assert '"synastry":      tool_synastry' in server_text
+    assert 'if __name__ == "__main__":' in server_text
+
+    synastry = bot.call_mcp("synastry", {
+        "a_year": 1981, "a_month": 2, "a_day": 23, "a_hour": 9,
+        "a_minute": 50, "a_timezone": 1, "a_lat": 52.44, "a_lon": 15.12,
+        "b_year": 1991, "b_month": 3, "b_day": 24, "b_hour": 3,
+        "b_minute": 41, "b_timezone": 3, "b_lat": 48.71, "b_lon": 44.51,
+    })["raw"]
+    assert "МЕЖКАРТОЧНЫЕ СВЯЗИ" in synastry
+    assert "НАЛОЖЕНИЕ В ДОМА" in synastry
 
     print(
         "OK: 64 cards, 384 lines, birth parser and "
