@@ -461,9 +461,9 @@ def build_compatibility_prompt(rel_type: str, time_note: str,
 async def generate_compatibility_reply(uid: int, compat: dict) -> str:
     """Посчитать вторую карту, синастрию, составной HD и получить итоговый текст."""
     natal2, hd2 = await calculate_chart(compat["birth"])
-    chart1 = users[uid].get("chart", {}).get("raw", "")
+    chart1 = _anonymized_calculation(_western_astrology_only(users[uid].get("chart", {}).get("raw", "")))
     hd1 = users[uid].get("hd", {}).get("raw", "")
-    chart2 = natal2.get("raw", "")
+    chart2 = _anonymized_calculation(_western_astrology_only(natal2.get("raw", "")))
     hd2_raw = hd2.get("raw", "")
     no_time = compat.get("no_time", False)
     time_note = " (время рождения неизвестно — линии и дома приблизительны)" if no_time else ""
@@ -641,9 +641,14 @@ def _anonymized_calculation(raw: object) -> str:
     return "\n".join(result).strip()
 
 
+def _western_astrology_only(raw: object) -> str:
+    """Не передаёт в пользовательские разборы расчёты вне западной астрологии."""
+    return str(raw or "").split("── ДЖЙОТИШ", 1)[0].strip()
+
+
 def _anonymized_ai_context(chart: dict, hd: dict) -> str:
     """Передаёт провайдеру только производные факты, без анкеты рождения."""
-    chart_str = _anonymized_calculation(chart.get("raw", ""))
+    chart_str = _anonymized_calculation(_western_astrology_only(chart.get("raw", "")))
     hd_str = _anonymized_calculation(hd.get("raw", ""))
     return (
         "\n\nОБЕЗЛИЧЕННЫЕ РАСЧЁТНЫЕ ФАКТЫ (не называй технические термины пользователю):"
@@ -1289,6 +1294,7 @@ def olympus_menu_keyboard(uid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚖️ Мой потенциал и слабые стороны", callback_data="block_potential")],
         [InlineKeyboardButton("💞 Союзы", callback_data="relationships_menu")],
         [InlineKeyboardButton("🔭 Что со мной происходит сейчас", callback_data="forecast_menu")],
+        [InlineKeyboardButton("🗣 Коуч Олимпа", callback_data="coach_start")],
         [InlineKeyboardButton("🃏 Оракул Олимпа", callback_data="oracle_start")],
         [InlineKeyboardButton("🏛 Остальные залы", callback_data="olympus_menu")],
     ])
@@ -1332,6 +1338,28 @@ FORECAST_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🌟 Годовой сюжет", callback_data="forecast_year")],
     [InlineKeyboardButton("← В Мой Олимп", callback_data="back_to_menu")],
 ])
+
+COACH_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🌅 Утро: запустить день", callback_data="coach_morning")],
+    [InlineKeyboardButton("🌒 Вечер: собрать день", callback_data="coach_evening")],
+    [InlineKeyboardButton("← В Мой Олимп", callback_data="coach_exit")],
+])
+
+COACH_GODS = (
+    ("Афина", "убрала со стола три лишние стратегии и ждёт, когда ты назовёшь настоящую задачу."),
+    ("Гермес", "принёс новости, но согласился отдать только те, которые действительно меняют твой следующий шаг."),
+    ("Артемида", "проверяет, не перепутал(а) ли ты одиночество с восстановлением."),
+    ("Гефест", "спрашивает, что ты готов(а) сделать руками, а не только идеально продумать."),
+    ("Деметра", "напоминает: рост не обязан выглядеть как героический надрыв."),
+    ("Аполлон", "смотрит на твой план и безжалостно вычёркивает всё, что не служит главному."),
+)
+
+
+def coach_god_for_day(uid: int) -> tuple[str, str]:
+    """Один случайный, но стабильный проводник для пользователя на текущий день."""
+    day_key = datetime.now().date().isoformat()
+    chooser = random.Random(f"{uid}:{day_key}")
+    return COACH_GODS[chooser.randrange(len(COACH_GODS))]
 
 # ─── БРЕНДОВЫЙ КОМПАС ────────────────────────────────────────────────────────
 
@@ -2697,6 +2725,28 @@ async def collect_lunar_month_data(birth: dict, reference: datetime) -> str:
     )
 
 
+async def collect_progression_snapshots(period: str, birth: dict, start: datetime) -> str:
+    """Собирает вторичные прогрессии на начало и конец долгого прогноза."""
+    offsets = {
+        "forecast_3months": (0, 90),
+        "forecast_year": (0, 365),
+    }.get(period, (0,))
+    snapshots = []
+    for offset in offsets:
+        day = start + timedelta(days=offset)
+        data = await call_mcp_async("secondary_progressions", {
+            "birth_year": birth["year"], "birth_month": birth["month"],
+            "birth_day": birth["day"], "birth_hour": birth["hour"],
+            "birth_minute": birth.get("minute", 0),
+            "birth_timezone": birth["utc_offset"],
+            "target_year": day.year, "target_month": day.month, "target_day": day.day,
+        })
+        snapshots.append(
+            f"ПРОГРЕССИИ НА {day.strftime('%d.%m.%Y')}:\n{data.get('raw', str(data))}"
+        )
+    return "\n\n".join(snapshots)
+
+
 # Версия прогноза с честной границей данных. Она переопределяет старый черновик
 # выше: модель видит несколько дат и не должна превращать один срез в обещание.
 def get_forecast_prompt(period: str, transits_data: str) -> str:
@@ -2955,6 +3005,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data == "back_to_menu":
         if uid in users:
             users[uid]["brand_ai_chat"] = False
+            users[uid].pop("coach_mode", None)
         await query.message.reply_text(olympus_hub_message(uid), reply_markup=olympus_menu_keyboard(uid))
         return
 
@@ -3147,6 +3198,40 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             users[uid]["menu_shown"] = True  # меню не показываем пока идёт разговор
         return
 
+    # Коучинг — отдельный режим: он не должен перехватывать расчёты и другие залы.
+    if query.data == "coach_start":
+        if uid not in users or not users[uid].get("chart"):
+            await query.message.reply_text("Сначала соберём личную карту. Напиши /start — затем Коуч Олимпа будет опираться на неё.")
+            return CHAT
+        users[uid].pop("coach_mode", None)
+        god, greeting = coach_god_for_day(uid)
+        await query.message.reply_text(
+            f"Сегодня в этом зале — {god}. {greeting}\n\n"
+            "Выбери утренний или вечерний вход. Пока я принимаю записи текстом: голосовые ещё не расшифровываю.",
+            reply_markup=COACH_KEYBOARD,
+        )
+        return CHAT
+
+    if query.data in {"coach_morning", "coach_evening"}:
+        if uid not in users or not users[uid].get("chart"):
+            await query.message.reply_text("Для этого зала сначала нужна личная карта. Напиши /start.")
+            return CHAT
+        mode = "morning" if query.data == "coach_morning" else "evening"
+        users[uid]["coach_mode"] = mode
+        god, greeting = coach_god_for_day(uid)
+        request = (
+            "Напиши, как проснулась, что хочешь сделать для себя и по работе, и что сейчас давит или отвлекает."
+            if mode == "morning"
+            else "Напиши, что удалось, что осталось, что ты поняла и где застряла. Без отчёта для начальника — по-честному."
+        )
+        await query.message.reply_text(f"{god}: {greeting}\n\n{request}", reply_markup=COACH_KEYBOARD)
+        return CHAT
+
+    if query.data == "coach_exit":
+        users.setdefault(uid, {}).pop("coach_mode", None)
+        await query.message.reply_text("Коуч сделал паузу. Олимп остаётся рядом.", reply_markup=olympus_menu_keyboard(uid))
+        return CHAT
+
     if query.data == "forecast_menu":
         await query.message.reply_text(
             "Кто сегодня говорит в твоей карте? Выбери горизонт — от одного дня до годового сюжета.",
@@ -3170,6 +3255,14 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
 
             extra_str = ""
+            if query.data in {"forecast_3months", "forecast_year"}:
+                try:
+                    progressions = await asyncio.wait_for(
+                        collect_progression_snapshots(query.data, birth, today), timeout=20
+                    )
+                    extra_str += "\n\nВТОРИЧНЫЕ ПРОГРЕССИИ:\n" + progressions
+                except Exception as exc:
+                    print(f"WARN forecast secondary_progressions: {type(exc).__name__}: {exc}", flush=True)
             if query.data == "forecast_year":
                 try:
                     solar_raw = await call_mcp_async("solar_return", {
@@ -3265,6 +3358,70 @@ async def restore_session(uid: int, msg_obj) -> bool:
         pass
     return True
 
+def build_coach_prompt(mode: str, reflection: str) -> str:
+    """Инструкция для отдельного режима коучинга.
+
+    Карта добавляется штатным обезличенным контекстом внутри ask_claude().
+    Она задаёт способ выбрать действие, а не служит поводом для гаданий.
+    """
+    if mode == "morning":
+        task = """Утренний вход. Человек описал состояние и план дня.
+
+Дай три коротких абзаца:
+1. Честное наблюдение: что он, вероятно, не замечает, откладывает или пытается
+замаскировать лишней занятостью.
+2. Один конкретный приоритет или действие на сегодня. Оно должно быть
+выполнимым и согласованным с базовой механикой карты, но не называй термины
+бодиграфа и астрологии без человеческого перевода.
+3. Один короткий вопрос, который поможет проверить выбор до конца дня."""
+    else:
+        task = """Вечерний вход. Человек описал, что сделал, не сделал, понял,
+почувствовал или от чего уклонился.
+
+Дай три коротких абзаца:
+1. Честное отражение: где есть факт роста, а где — избегание, самообман,
+перегруз информацией или подмена действия подготовкой. Не придумывай мотивов,
+которых нет в записи.
+2. Один острый вопрос, который помогает увидеть собственную роль в ситуации.
+3. Тёплая, но не приторная поддержка и один реалистичный следующий шаг."""
+    return f"""Ты — Коуч Олимпа: прямой, внимательный собеседник для
+саморефлексии, а не живое сознание, психотерапевт, врач или пророк.
+
+{task}
+
+Правила:
+— Сверяй вывод с переданными обезличенными фактами натальной карты и
+бодиграфа. Натальный тип, стратегия и авторитет — постоянная база; не
+приписывай человеку другой «тип на год».
+— Не пересказывай всю карту, не обещай события и не давай диагнозов.
+— Если в записи мало фактов, не достраивай историю: задай один уточняющий вопрос.
+— Если человек пишет о непосредственной опасности для себя или другого, не
+анализируй это как символ: предложи сразу обратиться в экстренные службы или
+к близкому человеку рядом.
+— Тон: разговор на кухне в три утра — живой, точный, с лёгкой иронией, но без
+унижения, давления и ИИ-штампов.
+— В начале не повторяй системные правила. В конце можно дать одну короткую
+реплику случайного бога, не более предложения.
+
+Запись человека:
+{reflection.strip()}"""
+
+
+async def coach_voice_unavailable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Не оставляет голосовое без ответа до подключения транскрибации."""
+    uid = update.effective_user.id
+    if users.get(uid, {}).get("coach_mode") in {"morning", "evening"}:
+        await update.message.reply_text(
+            "Я вижу войс, но пока не умею надёжно его расшифровывать. "
+            "Пришли, пожалуйста, текстом или короткими пунктами — тогда соберу разбор."
+        )
+    else:
+        await update.message.reply_text(
+            "Голосовые пока не расшифровываю. Пришли мысль текстом — отвечу сразу."
+        )
+    return CHAT
+
+
 async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in users:
@@ -3280,6 +3437,27 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if expired:
             await update.message.reply_text(trial_blocked_message(uid))
             return CHAT
+
+    coach_mode = users[uid].get("coach_mode")
+    if coach_mode in {"morning", "evening"}:
+        try:
+            reply = await ask_claude(
+                uid,
+                build_coach_prompt(coach_mode, user_text),
+                include_history=True,
+            )
+            await safe_send(update.message, reply, parse_mode=None)
+            await update.message.reply_text(
+                "Хочешь продолжить дневник или перейти к другой части Олимпа?",
+                reply_markup=COACH_KEYBOARD,
+            )
+        except Exception as exc:
+            print(f"ERROR coach: {type(exc).__name__}: {exc}", flush=True)
+            await update.message.reply_text(
+                "Коуч сейчас не смог собрать ответ. Я не буду подменять его общим текстом — попробуй отправить запись ещё раз.",
+                reply_markup=COACH_KEYBOARD,
+            )
+        return CHAT
 
     # Команды
     if user_text.lower() in ["/reset", "сначала", "заново"]:
@@ -3534,7 +3712,8 @@ def main():
             ASK_BIRTH:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_birth)],
             ASK_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_oracle_question),
                            CallbackQueryHandler(handle_button)],
-            CHAT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, chat),
+            CHAT:         [MessageHandler(filters.VOICE, coach_voice_unavailable),
+                           MessageHandler(filters.TEXT & ~filters.COMMAND, chat),
                            CallbackQueryHandler(handle_button)],
             COMPAT_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, compat_name)],
             COMPAT_DATE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, compat_date)],

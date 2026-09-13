@@ -1015,6 +1015,80 @@ def tool_lunar_return(args):
     return "\n".join(lines)
 
 
+def tool_secondary_progressions(args):
+    """Вторичные прогрессии: один день после рождения равен одному году жизни.
+
+    Инструмент выводит только проверяемые положения и связи прогрессивных
+    светил/планет с натальной картой. Прогрессивные дома не достраиваются:
+    для них нужна отдельно выбранная техника домификации.
+    """
+    import datetime as dt
+    year = int(args["birth_year"])
+    month = int(args["birth_month"])
+    day = int(args["birth_day"])
+    hour = int(args["birth_hour"])
+    minute = int(args.get("birth_minute", 0))
+    timezone = float(args["birth_timezone"])
+
+    now = dt.datetime.utcnow()
+    target_year = int(args.get("target_year", now.year))
+    target_month = int(args.get("target_month", now.month))
+    target_day = int(args.get("target_day", now.day))
+    target_hour = int(args.get("target_hour_utc", 12))
+    target_minute = int(args.get("target_minute_utc", 0))
+
+    natal_jd = birth_to_jd(year, month, day, hour, minute, timezone)
+    target_jd = swe.julday(
+        target_year, target_month, target_day, target_hour + target_minute / 60.0
+    )
+    # Вторичная прогрессия: 1 средний тропический год жизни = 1 день эфемериды.
+    age_years = (target_jd - natal_jd) / 365.2425
+    progressed_jd = natal_jd + age_years
+    natal = calc_planets(natal_jd, sidereal=False)
+    progressed = calc_planets(progressed_jd, sidereal=False)
+    p_date = swe.revjul(progressed_jd)
+    progression_date = (
+        f"{int(p_date[2]):02d}.{int(p_date[1]):02d}.{int(p_date[0])} "
+        f"{int(p_date[3]):02d}:{int((p_date[3] % 1) * 60):02d} UTC"
+    )
+
+    lines = ["═══ ВТОРИЧНЫЕ ПРОГРЕССИИ ═══"]
+    lines.append(f"Опорная дата: {target_day:02d}.{target_month:02d}.{target_year} UTC")
+    lines.append(f"Возраст в расчёте: {age_years:.2f} года")
+    lines.append(f"Эфемеридная дата прогрессии: {progression_date}")
+    lines.append("Метод: один день после рождения равен одному году жизни.")
+    lines.append("")
+    lines.append("── ПРОГРЕССИВНЫЕ ПОЛОЖЕНИЯ ──")
+    for name in ("Солнце", "Луна", "Меркурий", "Венера", "Марс"):
+        sign, deg, minute_value, _ = deg_to_sign(progressed[name]["lon"])
+        retrograde = " ℞" if progressed[name]["retro"] else ""
+        lines.append(f"{name:<10} {sign} {deg}°{minute_value:02d}'{retrograde}")
+
+    lines.extend(["", "── СВЯЗИ ПРОГРЕССИЙ С НАТАЛЬНОЙ КАРТОЙ ──"])
+    aspects = [(0, "соединение", 1.0), (60, "секстиль", 1.0),
+               (90, "квадрат", 1.0), (120, "трин", 1.0), (180, "оппозиция", 1.0)]
+    found = 0
+    for p_name in ("Солнце", "Луна", "Меркурий", "Венера", "Марс"):
+        for n_name in ("Солнце", "Луна", "Меркурий", "Венера", "Марс", "Юпитер", "Сатурн"):
+            delta = abs(progressed[p_name]["lon"] - natal[n_name]["lon"]) % 360
+            if delta > 180:
+                delta = 360 - delta
+            for angle, label, orb in aspects:
+                deviation = abs(delta - angle)
+                if deviation <= orb:
+                    lines.append(
+                        f"Прогрессивная {p_name} — натальный {n_name}: "
+                        f"{label} (орб {deviation:.2f}°)"
+                    )
+                    found += 1
+                    break
+    if not found:
+        lines.append("Нет мажорных связей в орбисе 1° между выбранными прогрессиями и натальными планетами.")
+    lines.append("")
+    lines.append("Прогрессии описывают медленный внутренний процесс; они не обещают внешнее событие.")
+    return "\n".join(lines)
+
+
 def tool_hd_cycles(args):
     """HD-циклы: возвраты/оппозиции и годовой календарь транзитов.
 
@@ -1410,6 +1484,27 @@ TOOLS_SCHEMA = [
         }
     },
     {
+        "name": "secondary_progressions",
+        "description": "Вторичные прогрессии: один день после рождения равен одному году жизни. Выводит прогрессивные личные планеты и их точные мажорные связи с натальной картой.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "birth_year": {"type":"integer"},
+                "birth_month": {"type":"integer"},
+                "birth_day": {"type":"integer"},
+                "birth_hour": {"type":"integer"},
+                "birth_minute": {"type":"integer","default":0},
+                "birth_timezone": {"type":"number"},
+                "target_year": {"type":"integer"},
+                "target_month": {"type":"integer"},
+                "target_day": {"type":"integer"},
+                "target_hour_utc": {"type":"integer","default":12},
+                "target_minute_utc": {"type":"integer","default":0}
+            },
+            "required":["birth_year","birth_month","birth_day","birth_hour","birth_timezone"]
+        }
+    },
+    {
         "name": "hd_cycles",
         "description": "HD-циклы: Solar/Rave Return, Saturn Return, Uranus Opposition, Chiron Return при доступной эфемериде и отдельный календарь прохождения Солнца через 64 ворот.",
         "inputSchema": {
@@ -1457,6 +1552,7 @@ TOOL_HANDLERS = {
     "human_design":  tool_human_design,
     "solar_return":  tool_solar_return,
     "lunar_return":  tool_lunar_return,
+    "secondary_progressions": tool_secondary_progressions,
     "hd_cycles":     tool_hd_cycles,
     "transits":      tool_transits,
 }

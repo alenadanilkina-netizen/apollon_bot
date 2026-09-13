@@ -51,6 +51,8 @@ def _is_handled_callback(callback: str, source_text: str) -> bool:
         return "query.data.removeprefix(\"persona_\")" in source_text
     if callback.startswith("compat_type_"):
         return "query.data in (\"compat_type_business\", \"compat_type_personal\")" in source_text
+    if callback.startswith("coach_"):
+        return "query.data in {\"coach_morning\", \"coach_evening\"}" in source_text
     return False
 
 
@@ -114,16 +116,23 @@ def main() -> None:
     assert 'call_mcp_async("natal_chart", params)' in source_text
     assert 'call_mcp_async("human_design", params)' in source_text
     assert "collect_lunar_month_data" in source_text
+    assert "collect_progression_snapshots" in source_text
+    assert 'call_mcp_async("secondary_progressions"' in source_text
     assert "ТЕКУЩИЙ ЛУНАР" in source_text
     assert "СЛЕДУЮЩИЙ ЛУНАР" in source_text
     assert 'call_mcp_async("synastry"' in source_text
     assert "fallback_forecast_reading(uid, query.data)" not in source_text
+    assert "coach_start" in source_text
+    assert "build_coach_prompt" in source_text
+    assert "MessageHandler(filters.VOICE, coach_voice_unavailable)" in source_text
 
     server_text = (ROOT / "server.py").read_text(encoding="utf-8")
     assert "import swisseph as swe" in server_text
     assert "swe.FLG_SWIEPH" in server_text
     assert "def tool_synastry(args):" in server_text
     assert '"synastry":      tool_synastry' in server_text
+    assert "def tool_secondary_progressions(args):" in server_text
+    assert '"secondary_progressions": tool_secondary_progressions' in server_text
     assert 'if __name__ == "__main__":' in server_text
 
     synastry = bot.call_mcp("synastry", {

@@ -7,8 +7,9 @@ import bot
 
 
 class FakeMessage:
-    def __init__(self) -> None:
+    def __init__(self, text: str = "") -> None:
         self.replies = []
+        self.text = text
 
     async def reply_text(self, text, **kwargs):
         self.replies.append((text, kwargs))
@@ -157,6 +158,38 @@ async def main() -> None:
         forecast_prompt = prompts[-1]
         assert "ТЕКУЩИЙ ЛУНАР" in forecast_prompt
         assert "СЛЕДУЮЩИЙ ЛУНАР" in forecast_prompt
+
+        # Коучинг — отдельный режим, не является подменой расчёта блока и
+        # всегда оставляет понятный путь назад в Олимп.
+        query = FakeQuery(uid, "coach_start")
+        await bot.handle_button(SimpleNamespace(callback_query=query), None)
+        assert "Сегодня в этом зале" in query.message.replies[-1][0]
+        assert query.message.replies[-1][1]["reply_markup"] is bot.COACH_KEYBOARD
+        query = FakeQuery(uid, "coach_morning")
+        await bot.handle_button(SimpleNamespace(callback_query=query), None)
+        assert bot.users[uid]["coach_mode"] == "morning"
+        prompt = bot.build_coach_prompt("morning", "Утром мне тревожно, а в плане три встречи.")
+        assert "Один конкретный приоритет" in prompt
+        assert "не живое сознание" in prompt
+        coach_prompts = []
+
+        async def coach_reply(_uid, prompt, include_history=True):
+            coach_prompts.append((prompt, include_history))
+            return "Сначала выбери одну встречу, которая действительно сдвигает дело.\n\nЧто станет легче, если перестать готовиться ко всем трём сразу?\n\nНе геройствуй: один ясный шаг уже меняет день."
+
+        bot.ask_claude = coach_reply
+        diary_message = FakeMessage("Я хочу всё успеть и уже устала.")
+        await bot.chat(SimpleNamespace(effective_user=SimpleNamespace(id=uid), message=diary_message), None)
+        assert coach_prompts and coach_prompts[-1][1] is True
+        assert "Ты — Коуч Олимпа" in coach_prompts[-1][0]
+        assert captured and "одну встречу" in captured.pop()[0]
+        bot.ask_claude = methodology_reply
+        voice = FakeMessage()
+        await bot.coach_voice_unavailable(SimpleNamespace(effective_user=SimpleNamespace(id=uid), message=voice), None)
+        assert "не умею надёжно его расшифровывать" in voice.replies[-1][0]
+        query = FakeQuery(uid, "coach_exit")
+        await bot.handle_button(SimpleNamespace(callback_query=query), None)
+        assert "coach_mode" not in bot.users[uid]
 
         # Политика одна: сначала открыть, затем отдельно принять.
         bot.users[uid] = {"history": []}
