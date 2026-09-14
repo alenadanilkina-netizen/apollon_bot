@@ -93,6 +93,8 @@ def main() -> None:
 
     assert bot._public_text_has_technical_leak("В 53-х воротах происходит давление.")
     assert bot._public_text_has_technical_leak("Венера в экзальтации обещает успех.")
+    assert bot._public_text_has_technical_leak("Соляр показывает тригон и ретроградный период.")
+    assert bot._public_text_has_technical_leak("Транзит активирует эмоциональный центр.")
     assert not bot._public_text_has_technical_leak("Новый этап стоит начинать, когда есть силы продолжать путь.")
 
     callbacks = _literal_callbacks()
@@ -119,6 +121,7 @@ def main() -> None:
     assert "collect_progression_snapshots" in source_text
     assert 'call_mcp_async("secondary_progressions"' in source_text
     assert 'include_history=False, context_scope="forecast"' in source_text
+    assert "technical terminology leaked into forecast" in source_text
     assert "ТЕКУЩИЙ ЛУНАР" in source_text
     assert "СЛЕДУЮЩИЙ ЛУНАР" in source_text
     assert 'call_mcp_async("synastry"' in source_text
