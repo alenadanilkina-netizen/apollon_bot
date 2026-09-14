@@ -161,6 +161,20 @@ async def main() -> None:
         assert "ТЕКУЩИЙ ЛУНАР" in forecast_prompt
         assert "СЛЕДУЮЩИЙ ЛУНАР" in forecast_prompt
 
+        # Если провайдер всё же вынес расчётный жаргон наружу, ответ не
+        # отбрасывается: он быстро редактируется без повторной загрузки карты.
+        async def plain_language_reply(_uid, prompt, include_history=True, context_scope="full"):
+            assert "ЧЕРНОВИК" in prompt
+            assert include_history is False
+            assert context_scope == "none"
+            return "Ближайшие дни предлагают не торопить решение: сначала собери факты, затем назови условия вслух.\n\nПроверь один разговор, в котором ясность важнее скорости."
+
+        bot.ask_claude = plain_language_reply
+        cleaned = await bot.rewrite_public_reply(uid, "Соляр показывает тригон и 53-е ворота.")
+        assert "соляр" not in cleaned.lower()
+        assert not bot._public_text_has_technical_leak(cleaned)
+        bot.ask_claude = methodology_reply
+
         # Коучинг — отдельный режим, не является подменой расчёта блока и
         # всегда оставляет понятный путь назад в Олимп.
         query = FakeQuery(uid, "coach_start")

@@ -482,7 +482,7 @@ async def generate_compatibility_reply(uid: int, compat: dict) -> str:
         compat.get("type", "отношения"), time_note,
         chart1, hd1, chart2, hd2_raw, synastry_raw.get("raw", str(synastry_raw)),
     )
-    return await ask_claude(uid, prompt)
+    return await rewrite_public_reply(uid, await ask_claude(uid, prompt, include_history=False))
 
 # ─── AI PROVIDERS ─────────────────────────────────────────────────────────────
 
@@ -720,7 +720,9 @@ def _ask_claude_sync(
         else:
             blocks_note = ""
 
-        if context_scope == "forecast":
+        if context_scope == "none":
+            context = ""
+        elif context_scope == "forecast":
             context = _forecast_ai_context(chart, hd)
         else:
             context = _anonymized_ai_context(chart, hd) + blocks_note
@@ -763,12 +765,6 @@ def _ask_claude_sync(
                 continue
 
             if reply.strip():
-                # Системная инструкция для модели — не единственная защита.
-                # Старые библиотечные формулировки иногда буквально повторялись
-                # в ответе. Такой ответ не показываем: следующий провайдер или
-                # резервный разбор дадут понятный текст без учебного жаргона.
-                if _public_text_has_technical_leak(reply):
-                    raise RuntimeError("technical terminology leaked into public reply")
                 print(f"AI provider succeeded: {provider}", flush=True)
                 break
             raise RuntimeError("empty response")
@@ -800,6 +796,24 @@ async def ask_claude(
         asyncio.to_thread(_ask_claude_sync, user_id, message, include_history, context_scope),
         timeout=AI_RESPONSE_TIMEOUT_SECONDS,
     )
+
+
+async def rewrite_public_reply(uid: int, draft: str) -> str:
+    """Убирает из готового ответа расчётный жаргон без повторного расчёта карты."""
+    if not _public_text_has_technical_leak(draft):
+        return draft
+    rewritten = await ask_claude(
+        uid,
+        "Отредактируй черновик ниже для человека, который не знает астрологию "
+        "и Дизайн Человека. Сохрани все наблюдаемые жизненные смыслы, даты и "
+        "практические выводы, но убери технические названия систем, расчётных "
+        "техник, планет, аспектов, ворот, линий, каналов, центров и типов. "
+        "Не добавляй новых фактов и не объясняй, что ты редактировал.\n\n"
+        f"ЧЕРНОВИК:\n{draft}",
+        include_history=False,
+        context_scope="none",
+    )
+    return rewritten
 
 
 # Единое имя для новых обработчиков; старые сценарии сохраняют совместимость.
@@ -2962,7 +2976,9 @@ async def deliver_block_reading(message_obj, uid: int, block: str) -> None:
         if not users.get(uid, {}).get("chart") or not users.get(uid, {}).get("hd"):
             raise RuntimeError("calculated natal chart or bodygraph is missing")
 
-        reply = await ask_claude(uid, methodology, include_history=False)
+        reply = await rewrite_public_reply(
+            uid, await ask_claude(uid, methodology, include_history=False)
+        )
         paragraphs = [part.strip() for part in reply.split("\n\n") if part.strip()]
         if len(paragraphs) < 4 or len(reply.strip()) < 900:
             raise RuntimeError("methodology reply is incomplete")
@@ -3334,17 +3350,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Прогноз не имеет отдельного технического блока. Если модель всё
             # же вынесла внутренний расчёт наружу, просим переписать тот же
             # смысл человеческим языком и не отправляем сырой черновик.
-            if _public_text_has_technical_leak(reply):
-                reply = await ask_claude(
-                    uid,
-                    "Перепиши черновик прогноза ниже. Сохрани только смысл, даты и "
-                    "наблюдаемые жизненные ситуации. Полностью убери терминологию "
-                    "астрологии и Дизайна Человека, названия расчётных техник, планет, "
-                    "аспектов, ворот, линий, каналов и центров. Не добавляй новых фактов.\n\n"
-                    f"ЧЕРНОВИК:\n{reply}",
-                    include_history=False,
-                    context_scope="forecast",
-                )
+            reply = await rewrite_public_reply(uid, reply)
             if _public_text_has_technical_leak(reply):
                 raise RuntimeError("technical terminology leaked into forecast")
             await safe_send(query.message, reply)

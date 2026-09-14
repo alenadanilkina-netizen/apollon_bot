@@ -110,7 +110,8 @@ def main() -> None:
     assert "await deliver_block_reading(query.message, uid, query.data)" in source_text
     assert "ctx.application.create_task(" not in source_text
     assert "active_background_tasks" not in source_text
-    assert "reply = await ask_claude(uid, methodology, include_history=False)" in source_text
+    assert "await ask_claude(uid, methodology, include_history=False)" in source_text
+    assert "rewrite_public_reply" in source_text
     assert "ready_block_reading(uid, block)" not in source_text
     assert "generic personal readings are forbidden" in source_text
     assert "Я не буду заменять его общим текстом" in source_text
