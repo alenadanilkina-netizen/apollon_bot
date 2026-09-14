@@ -118,6 +118,7 @@ def main() -> None:
     assert "collect_lunar_month_data" in source_text
     assert "collect_progression_snapshots" in source_text
     assert 'call_mcp_async("secondary_progressions"' in source_text
+    assert 'include_history=False, context_scope="forecast"' in source_text
     assert "ТЕКУЩИЙ ЛУНАР" in source_text
     assert "СЛЕДУЮЩИЙ ЛУНАР" in source_text
     assert 'call_mcp_async("synastry"' in source_text
@@ -143,6 +144,13 @@ def main() -> None:
     })["raw"]
     assert "МЕЖКАРТОЧНЫЕ СВЯЗИ" in synastry
     assert "НАЛОЖЕНИЕ В ДОМА" in synastry
+
+    forecast_context = bot._forecast_ai_context(
+        {"raw": "Дата: 23.02.1981\nСолнце: Рыбы 3°"},
+        {"raw": "ТИП: Проектор\nАВТОРИТЕТ: Эмоциональный\nПРОФИЛЬ: 5/1"},
+    )
+    assert "1981" not in forecast_context
+    assert "НАТАЛЬНЫЙ БОДИГРАФ" in forecast_context
 
     print(
         "OK: 64 cards, 384 lines, birth parser and "

@@ -53,9 +53,11 @@ async def main() -> None:
     async def capture_send(_message, text, **kwargs):
         captured.append((text, kwargs))
 
-    async def methodology_reply(_uid, prompt, include_history=True):
+    async def methodology_reply(_uid, prompt, include_history=True, context_scope="full"):
         prompts.append(prompt)
         if "Сделай ясный прогноз" in prompt:
+            assert include_history is False
+            assert context_scope == "forecast"
             return "\n\n".join([
                 "Период собран из точных расчётных срезов: здесь видны даты, на которых держится прогноз, а не общая формула для всех.",
                 "Первый отрезок показывает текущий ритм и задачу, которую стоит довести до ясной договорённости без лишней спешки.",
@@ -79,10 +81,10 @@ async def main() -> None:
             "Боги предлагают не торопиться с выводом: сначала посмотри, как эта мысль выдержит обычную жизнь, а не только красивую беседу на Олимпе.",
         ])
 
-    async def delayed_methodology_reply(_uid, prompt, include_history=True):
+    async def delayed_methodology_reply(_uid, prompt, include_history=True, context_scope="full"):
         delayed_started.set()
         await delayed_release.wait()
-        return await methodology_reply(_uid, prompt, include_history)
+        return await methodology_reply(_uid, prompt, include_history, context_scope)
 
     try:
         # Каждая кнопка обязана использовать свою методологию, а не общий шаблон.
@@ -136,7 +138,7 @@ async def main() -> None:
             raise AssertionError("generic personal reading path must remain forbidden")
 
         # Сбой внешнего провайдера не имеет права оставить только заставку.
-        async def failed_methodology_reply(_uid, _prompt, include_history=True):
+        async def failed_methodology_reply(_uid, _prompt, include_history=True, context_scope="full"):
             raise TimeoutError("provider unavailable")
 
         bot.ask_claude = failed_methodology_reply
@@ -173,7 +175,7 @@ async def main() -> None:
         assert "не живое сознание" in prompt
         coach_prompts = []
 
-        async def coach_reply(_uid, prompt, include_history=True):
+        async def coach_reply(_uid, prompt, include_history=True, context_scope="full"):
             coach_prompts.append((prompt, include_history))
             return "Сначала выбери одну встречу, которая действительно сдвигает дело.\n\nЧто станет легче, если перестать готовиться ко всем трём сразу?\n\nНе геройствуй: один ясный шаг уже меняет день."
 

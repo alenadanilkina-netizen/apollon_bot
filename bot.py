@@ -661,7 +661,36 @@ def _anonymized_ai_context(chart: dict, hd: dict) -> str:
     )
 
 
-def _ask_claude_sync(user_id: int, message: str, include_history: bool = True) -> str:
+def _forecast_ai_context(chart: dict, hd: dict) -> str:
+    """Компактная база для прогноза.
+
+    В прогноз нельзя отправлять всю историю и всю библиотеку: это увеличивало
+    запрос до десятков тысяч знаков и на Railway завершалось тайм-аутом после
+    сообщения «Сверяю эфемериды». Здесь сохраняются расчётные факты и только
+    нужные HD-ключи; интерпретации периода добавляет отдельный расчёт срезов.
+    """
+    chart_str = _anonymized_calculation(_western_astrology_only(chart.get("raw", "")))
+    hd_str = _anonymized_calculation(hd.get("raw", ""))
+    hd_context = get_hd_context(hd)
+    # Это лимит контекста, а не лимит расчёта: базовые факты выше не режутся.
+    if len(hd_context) > 6000:
+        hd_context = hd_context[:6000].rsplit("\n", 1)[0] + "\n[дальнейшие библиотечные фрагменты не нужны для прогноза]"
+    return (
+        "\n\nОБЕЗЛИЧЕННАЯ БАЗА ПРОГНОЗА (не называй технические термины без перевода):"
+        f"\nНАТАЛЬНАЯ АСТРОЛОГИЯ:\n{chart_str}"
+        f"\n\nНАТАЛЬНЫЙ БОДИГРАФ:\n{hd_str}"
+        f"\n\nПОДТВЕРЖДЁННЫЕ HD-КЛЮЧИ:\n{hd_context}"
+        f"\n\nПРОФИЛЬ:\n{get_profile_context(hd)}"
+        f"\n\nКРЕСТ:\n{get_cross_context(hd)}"
+    )
+
+
+def _ask_claude_sync(
+    user_id: int,
+    message: str,
+    include_history: bool = True,
+    context_scope: str = "full",
+) -> str:
     user = users.get(user_id, {})
     history = user.get("history", [])
 
@@ -691,7 +720,10 @@ def _ask_claude_sync(user_id: int, message: str, include_history: bool = True) -
         else:
             blocks_note = ""
 
-        context = _anonymized_ai_context(chart, hd) + blocks_note
+        if context_scope == "forecast":
+            context = _forecast_ai_context(chart, hd)
+        else:
+            context = _anonymized_ai_context(chart, hd) + blocks_note
 
     # Каждый зал снова получает рассчитанную карту. Раньше контекст добавлялся
     # только к первому запросу, и следующие кнопки порождали общий текст.
@@ -758,9 +790,14 @@ def _ask_claude_sync(user_id: int, message: str, include_history: bool = True) -
     users[user_id]["history"] = saved_history[-12:]
     return reply
 
-async def ask_claude(user_id: int, message: str, include_history: bool = True) -> str:
+async def ask_claude(
+    user_id: int,
+    message: str,
+    include_history: bool = True,
+    context_scope: str = "full",
+) -> str:
     return await asyncio.wait_for(
-        asyncio.to_thread(_ask_claude_sync, user_id, message, include_history),
+        asyncio.to_thread(_ask_claude_sync, user_id, message, include_history, context_scope),
         timeout=AI_RESPONSE_TIMEOUT_SECONDS,
     )
 
@@ -2661,9 +2698,12 @@ async def collect_transit_snapshots(period: str, birth: dict, start: datetime) -
     """Собирает несколько честных срезов, чтобы не выдавать одну дату за период."""
     offsets = {
         "forecast_day": [0],
-        "forecast_month": [0, 7, 14, 21, 28],
-        "forecast_3months": [0, 14, 28, 42, 56, 70, 84],
-        "forecast_year": [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330],
+        # Это опорные точки текста, а не упрощение эфемерид. Для месяца
+        # границы дополнительно задают два точных лунара; для долгих периодов
+        # достаточно начала, середины и конца / четырёх кварталов.
+        "forecast_month": [0, 14, 28],
+        "forecast_3months": [0, 30, 60, 90],
+        "forecast_year": [0, 91, 182, 273, 365],
     }.get(period, [0])
     snapshots = []
     for offset in offsets:
@@ -3301,7 +3341,10 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Обращайся на 'ты' без имени; используй нейтральные формулировки.\n\n"
                 f"{get_forecast_prompt(query.data, transits_str + extra_str)}"
             )
-            reply = await ask_claude(uid, prompt)
+            # Прогноз автономен: ему не нужна история прежних залов. Иначе
+            # один клик собирал десятки тысяч лишних символов и не успевал
+            # вернуться в Telegram до тайм-аута.
+            reply = await ask_claude(uid, prompt, include_history=False, context_scope="forecast")
             await safe_send(query.message, reply)
         except asyncio.TimeoutError:
             print("ERROR forecast: AI response timeout", flush=True)
